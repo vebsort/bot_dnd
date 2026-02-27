@@ -1,14 +1,19 @@
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+from vk_api.upload import VkUpload
 import random
+import re
 import json
 import os
+import tempfile
 from urllib.parse import quote
+import requests
 import dnd5e_data
 
 import keyboards #импорт клавиатур
 from dnd_character_generator import generate_character # Это ваш модуль для генерации персонажей
+import character_sheet_image
 
 # Настройки бота
 GROUP_ID = '179538565'
@@ -20,10 +25,13 @@ symbol = '/'
 vk_session = vk_api.VkApi(token=TOKEN)
 longpoll = VkBotLongPoll(vk_session, GROUP_ID)
 vk = vk_session.get_api()
+vk_upload = VkUpload(vk_session)
 
 # Состояния пользователей (для простой машины состояний)
 user_states = {}
 user_warnings = {}
+# Последний бросок по user_id для переброса вдохновением (-вдох)
+last_roll_by_user = {}
 
 
 def get_photo_attachment(attachments):
@@ -41,6 +49,77 @@ def get_photo_attachment(attachments):
                     return f"photo{oid}_{pid}_{acc}"
                 return f"photo{oid}_{pid}"
     return None
+
+
+def get_photo_url_from_attachments(attachments):
+    """Из вложений сообщения извлекает URL фото наибольшего размера (для сохранения и последующей вставки в лист)."""
+    if not attachments:
+        return None
+    for att in attachments:
+        if att.get('type') != 'photo':
+            continue
+        ph = att.get('photo', {})
+        sizes = ph.get('sizes')
+        if not sizes:
+            for key in ('photo_2560', 'photo_1280', 'photo_807', 'photo_604', 'url'):
+                u = ph.get(key)
+                if u:
+                    return u
+            return None
+        best = max(sizes, key=lambda s: (s.get('width', 0) or 0) * (s.get('height', 0) or 0))
+        url = best.get('url')
+        if url:
+            return url
+    return None
+
+
+def download_character_photo(photo_attachment, image_url=None, vk_api_obj=None):
+    """Скачивает фото во временный файл. Сначала пробует image_url (URL, сохранённый при загрузке), иначе — VK API photos.getById. Возвращает путь к файлу или None."""
+    if image_url:
+        try:
+            r = requests.get(image_url, timeout=10)
+            r.raise_for_status()
+            fd, path = tempfile.mkstemp(suffix='.jpg')
+            os.write(fd, r.content)
+            os.close(fd)
+            return path
+        except Exception:
+            pass
+    if not photo_attachment or not photo_attachment.startswith('photo'):
+        return None
+    parts = photo_attachment.replace('photo', '').split('_')
+    if len(parts) < 2:
+        return None
+    try:
+        owner_id, photo_id = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return None
+    api = vk_api_obj or vk
+    try:
+        resp = api.photos.getById(photos=f"{owner_id}_{photo_id}")
+        if not resp or not isinstance(resp, list):
+            return None
+        photo = resp[0]
+        url = None
+        sizes = photo.get('sizes') or []
+        if sizes:
+            best = max(sizes, key=lambda s: s.get('width', 0) * s.get('height', 0))
+            url = best.get('url')
+        if not url:
+            for key in ('photo_2560', 'photo_1280', 'photo_807', 'photo_604', 'url'):
+                url = photo.get(key)
+                if url:
+                    break
+        if not url:
+            return None
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        fd, path = tempfile.mkstemp(suffix='.jpg')
+        os.write(fd, r.content)
+        os.close(fd)
+        return path
+    except Exception:
+        return None
 
 
 #функция отправки сообщения (в зависимости от лички/беседы меняет параметры)
@@ -171,7 +250,14 @@ def array_to_text_color_array(array, color = "primary"):
     return text_color_array 
 
 
-def subrace_keyboard_array_maker(race):
+def subrace_keyboard_array_maker(race, edition='2014'):
+    # Редакция 2024: подрасы только у эльфа и гнома
+    if edition == '2024':
+        if race and race.lower() in dnd5e_data.race_to_subrace_2024:
+            names = dnd5e_data.race_to_subrace_2024[race.lower()]
+            text_color_array = [[n, 'primary'] for n in names]
+            return keyboard_array_maker(text_color_array, 1, hasbackbutton=True)
+        return keyboard_array_maker([], 1, hasbackbutton=True)
     if race == 'Дварф': #добавление условий со всеми расами
         text_color_array = [
             ['Горный дварф', 'primary'],
@@ -261,7 +347,8 @@ def keyboard_maker(codeword_or_button_array, number=0, keyboard_columns = 5, add
     if codeword_or_button_array == 'chars_list':
         button_array = char_choice_keyboard_array_maker()
     elif codeword_or_button_array == 'subraces_list':
-        button_array = subrace_keyboard_array_maker(user_states[user_id]['character']['race'])
+        edition = user_states[user_id].get('edition', '2014') if user_id in user_states else '2014'
+        button_array = subrace_keyboard_array_maker(user_states[user_id]['character']['race'], edition)
     elif codeword_or_button_array == 'numbered_list': 
         button_array = numbered_keyboard_array_maker(number=number, additional_button_name=additional_button_name, hasbackbutton=hasbackbutton)
     else: 
@@ -307,6 +394,36 @@ def get_main_char_id(user_id): #-1 = error
     except KeyError:
         main_char_id = -1
     return main_char_id
+
+def get_user_edition(user_id):
+    """Возвращает редакцию правил для пользователя: '2014' или '2024'. По умолчанию 2014."""
+    filename = 'data/user_edition.json'
+    if not os.path.exists('data'):
+        os.makedirs('data')
+    try:
+        if os.path.exists(filename):
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data.get(str(user_id), '2014')
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return '2014'
+
+def set_user_edition(user_id, edition):
+    """Сохраняет выбор редакции (2014 или 2024) для пользователя."""
+    filename = 'data/user_edition.json'
+    if not os.path.exists('data'):
+        os.makedirs('data')
+    data = {}
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    data[str(user_id)] = edition
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 def save_character(user_id, character): #добавляет нового персонажа в json файл пользователя 
     """Сохраняет персонажа в файл"""
@@ -360,19 +477,34 @@ def load_main_character(user_id):
 # --- Напарники (компаньоны) ---
 COMPANIONS_FILENAME = lambda uid: f'companions/{uid}.json'
 RESERVED_NICKNAMES = frozenset(dnd5e_data.code_word_list + [
-    'напарник', 'нап', 'напар', 'помощь', 'пом', 'создать', 'я', 'дом', 'привет', 'начать',
+    'напарник', 'нап', 'напар', 'помощь', 'пом', 'создать', 'я', 'лист', 'дом', 'привет', 'начать',
     'справка', 'справ', 'спр', 'снар', 'ос', 'до', 'ко', 'закл', 'деньги', 'мон', 'навыки',
-    'мои', 'персонажи', 'создать персонажа', 'помощ'
+    'мои', 'персонажи', 'создать персонажа', 'помощ',
+    'уд', 'удалить', 'исп'  # раздельные команды напарника: нап уд кличка, кличка исп лов
 ])
-COMPANION_STAT_SUFFIXES = ('мини', 'пз', 'макс', 'мпз', 'кб', 'атак', 'атк', 'уров', 'ур', 'уровень',
+COMPANION_STAT_SUFFIXES = ('ини', 'пз', 'макс', 'мпз', 'кб', 'атак', 'атк', 'уров', 'ур', 'уровень',
     'лов', 'сил', 'вын', 'инт', 'муд', 'хар', 'акр', 'атл', 'вни', 'выж', 'дре', 'зап',
     'ист', 'лрк', 'лр', 'маг', 'мед', 'обм', 'при', 'про', 'рас', 'рел', 'скр', 'убе')
 # Ловкость рук: оба варианта (лр, лрк) хранятся под ключом 'лр'
 COMPANION_SKILL_STORAGE_KEY = lambda suf: 'лр' if suf in ('лр', 'лрк') else suf
-# Испытания напарника: кличка + исплов / испсил / испвын / испинт / испмуд / испхар
-COMPANION_TRIAL_SUFFIXES = ('исплов', 'испсил', 'испвын', 'испинт', 'испмуд', 'испхар')
-COMPANION_TRIAL_NAMES = {'исплов': 'Испытание Ловкости', 'испсил': 'Испытание Силы', 'испвын': 'Испытание Выносливости',
-    'испинт': 'Испытание Интеллекта', 'испмуд': 'Испытание Мудрости', 'испхар': 'Испытание Харизмы'}
+# Испытания напарника: [кличка] исп <характеристика> (раздельные слова)
+# Поддерживаем сокращения и полные слова; храним модификаторы в канонических ключах.
+COMPANION_TRIAL_CODE_MAP = {
+    'сил': 'сил', 'сила': 'сил',
+    'лов': 'лов', 'лвк': 'лов', 'ловкость': 'лов',
+    'вын': 'вын', 'выносливость': 'вын',
+    'инт': 'инт', 'интеллект': 'инт',
+    'муд': 'муд', 'мдр': 'муд', 'мудр': 'муд', 'мудрость': 'муд',
+    'хар': 'хар', 'харизма': 'хар',
+}
+COMPANION_TRIAL_NAMES = {
+    'лов': 'Испытание Ловкости',
+    'сил': 'Испытание Силы',
+    'вын': 'Испытание Выносливости',
+    'инт': 'Испытание Интеллекта',
+    'муд': 'Испытание Мудрости',
+    'хар': 'Испытание Харизмы',
+}
 # Полные названия навыков/характеристик для напарника (как в get_mod)
 COMPANION_SKILL_DISPLAY = {
     'сил': 'Сила', 'сила': 'Сила', 'лов': 'Ловкость', 'лвк': 'Ловкость', 'ловкость': 'Ловкость',
@@ -415,7 +547,7 @@ def format_companion_roll(comp_name, check_name, roll_val, mod):
     return f"{comp_name},\n{header}d20 = {total} 🎲\n\n[{roll_val}{tail}"
 
 def load_companions(user_id):
-    """Загружает напарников пользователя: {кличка: {name, hp, max_hp, ac, initiative, attack_bonus, level, skills}}"""
+    """Загружает напарников пользователя: {[кличка]: {name, hp, max_hp, ac, initiative, attack_bonus, level, skills}}"""
     try:
         path = COMPANIONS_FILENAME(user_id)
         if os.path.exists(path):
@@ -464,12 +596,12 @@ def companion_card_text(companion):
     )
 
 def companions_list_text(companions):
-    """Краткий список напарников: имя, кличка, ПЗ, КБ."""
+    """Краткий список напарников: имя, [кличка], ПЗ, КБ."""
     if not companions:
         return (
             "У вас пока нет напарников.\n\n"
             "Как добавить напарника:\n"
-            "• Напишите: нап <имя> <кличка>\n"
+            "• Напишите: нап <имя> [кличка]\n"
             "• Пример: нап Римус рим\n"
             "• Тогда карточка будет по команде /рим\n\n"
             "Команды: нап, напарник, напар — список или добавление."
@@ -607,8 +739,161 @@ def change_param(character, param, value, characters='none'):
 def money_sum(money_dict):
     return round(money_dict['пм']*10 + money_dict['зм'] + money_dict['эм'] / 2 + money_dict['см'] /10 + money_dict['мм']/100, 2)
 
-def create_item(character, name, desc='', amount=1, value=0, valuetype='зм', weight=0, itemtype='none', damage='none', damagetype='none', delete=False):
+# Типы монет (нижний регистр для хранения); в 2024 при отображении — верхний (ЗМ, ПМ и т.д.)
+COIN_TYPES = ['пм', 'зм', 'эм', 'см', 'мм']
+WEIGHT_PATTERN = re.compile(r'(\d+)\s*(фунтов|фунт\.?|фунта|унций|унц\.?|унции|унц)\b', re.I)
+COST_IN_PARENS = re.compile(r'\(\s*(\d+)\s*(пм|зм|эм|см|мм)\s*\)', re.I)
+COST_PLAIN = re.compile(r'(\d+)\s*(пм|зм|эм|см|мм)\b', re.I)
+
+
+def _format_coin(coin_type, edition='2014'):
+    """Для редакции 2024 возвращает тип монеты в верхнем регистре (ЗМ, ПМ и т.д.)."""
+    if edition == '2024':
+        return coin_type.upper()
+    return coin_type
+
+
+def _format_item_cost(cost_dict, edition='2014'):
+    """Форматирует стоимость предмета из словаря {тип: количество}."""
+    if not cost_dict:
+        return ''
+    parts = []
+    for ct in COIN_TYPES:
+        if cost_dict.get(ct):
+            parts.append(f"{cost_dict[ct]} {_format_coin(ct, edition)}")
+    return ', '.join(parts)
+
+
+def parse_equipment_bulk(text):
+    """
+    Парсит строку с перечислением предметов через запятую.
+    Возвращает список dict: name, amount, cost (dict), weight_str.
+    Пример: "5 Кинжал, рубин 5 фунтов (50 зм), ложка 1 фунт" -> [...]
+    """
+    results = []
+    for segment in text.split(','):
+        s = segment.strip()
+        if not s:
+            continue
+        cost_list = []
+        # Стоимость в скобках: (50 зм), (50 ЗМ)
+        for m in COST_IN_PARENS.finditer(s):
+            cost_list.append((int(m.group(1)), m.group(2).lower()))
+        s = COST_IN_PARENS.sub('', s).strip()
+        # Стоимость без скобок: 14 пм, 14зм
+        for m in COST_PLAIN.finditer(s):
+            cost_list.append((int(m.group(1)), m.group(2).lower()))
+        s = COST_PLAIN.sub('', s).strip()
+        # Вес: 5 фунтов, 1 фунт, 2 унц
+        weight_str = ''
+        weight_m = WEIGHT_PATTERN.search(s)
+        if weight_m:
+            weight_str = weight_m.group(0).strip()
+            s = s.replace(weight_m.group(0), '', 1).strip()
+        s = re.sub(r'\s+', ' ', s).strip()
+        parts = s.split()
+        amount = 1
+        if parts and parts[-1].isdigit():
+            amount = int(parts[-1])
+            parts = parts[:-1]
+        if parts and parts[0].isdigit():
+            amount = int(parts[0])
+            parts = parts[1:]
+        name = ' '.join(parts).strip()
+        if not name:
+            continue
+        cost_dict = {}
+        for am, ct in cost_list:
+            cost_dict[ct] = cost_dict.get(ct, 0) + am
+        results.append({'name': name, 'amount': amount, 'cost': cost_dict, 'weight_str': weight_str})
+    return results
+
+
+def _item_cost_dict(item):
+    """Возвращает стоимость предмета как dict (для сравнения). Вес не учитывается."""
+    if item.get('cost'):
+        return dict(item['cost'])
+    if item.get('value') or item.get('valuetype'):
+        return {item.get('valuetype', 'зм'): item.get('value', 0)}
+    return {}
+
+
+def delete_equipment_bulk(character, parsed_items):
+    """
+    Удаляет перечисленные предметы. Совпадение по названию и стоимости (вес не проверяется).
+    Если стоимость не совпадает — предмет не удаляется.
+    Возвращает (deleted_count, errors_list).
+    """
     equipment_list = character['equipment']
+    deleted_count = 0
+    errors = []
+    for it in parsed_items:
+        name = it['name']
+        amount = it['amount']
+        cost = it.get('cost') or {}
+        # Нормализуем: только ключи из COIN_TYPES, убираем нули
+        cost = {k: v for k, v in cost.items() if k in COIN_TYPES and v}
+        found = False
+        for i in range(len(equipment_list) - 1, -1, -1):
+            eq = equipment_list[i]
+            if eq['name'].lower() != name.lower():
+                continue
+            eq_cost = _item_cost_dict(eq)
+            eq_cost = {k: v for k, v in eq_cost.items() if k in COIN_TYPES and v}
+            if eq_cost != cost:
+                errors.append(f"{name}: не совпадает стоимость (не удалён)")
+                found = True
+                break
+            # Совпадают название и стоимость — уменьшаем количество или удаляем
+            cur_amount = eq.get('amount', 1)
+            if amount > cur_amount:
+                errors.append(f"{name}: нет столько (есть {cur_amount})")
+                found = True
+                break
+            if amount >= cur_amount:
+                equipment_list.pop(i)
+                deleted_count += cur_amount
+            else:
+                eq['amount'] = cur_amount - amount
+                deleted_count += amount
+            found = True
+            break
+        if not found:
+            errors.append(f"{name}: не найден")
+    return deleted_count, errors
+
+
+def delete_equipment_by_name_all(character, names):
+    """
+    Удаляет все предметы с указанными названиями (любая стоимость, весь стак).
+    names — список строк. Возвращает (суммарное количество удалённых, список не найденных).
+    """
+    equipment_list = character['equipment']
+    deleted_count = 0
+    not_found = []
+    for name in names:
+        name = name.strip()
+        if not name:
+            continue
+        name_lower = name.lower()
+        found_any = False
+        for i in range(len(equipment_list) - 1, -1, -1):
+            if equipment_list[i]['name'].lower() == name_lower:
+                deleted_count += equipment_list[i].get('amount', 1)
+                equipment_list.pop(i)
+                found_any = True
+        if not found_any:
+            not_found.append(f"{name}: не найден")
+    return deleted_count, not_found
+
+
+def create_item(character, name, desc='', amount=1, value=0, valuetype='зм', weight=0, itemtype='none', damage='none', damagetype='none', delete=False, cost=None, weight_str=''):
+    """cost — опциональный dict вида {'зм': 50, 'пм': 14}. weight_str — строка вида '5 фунтов' или '2 унц'."""
+    equipment_list = character['equipment']
+    if cost is None and (value or valuetype):
+        cost = {valuetype: value} if value else {}
+    if cost is None:
+        cost = {}
     if delete == True:
         amount = amount * -1
     if len(equipment_list) > 0:
@@ -624,7 +909,7 @@ def create_item(character, name, desc='', amount=1, value=0, valuetype='зм', w
     if amount < 0:
         send_message("У вас нет такого предмета, невозможно удалить.")
         return -1
-    equipment_list.append({
+    item = {
         'id': len(equipment_list) + 1,
         'name': name,
         'desc': desc,
@@ -634,8 +919,13 @@ def create_item(character, name, desc='', amount=1, value=0, valuetype='зм', w
         'weight': weight,
         'itemtype': itemtype,
         'damage': damage,
-        'damagetype': damagetype,     
-    })
+        'damagetype': damagetype,
+    }
+    if cost:
+        item['cost'] = cost
+    if weight_str:
+        item['weight_str'] = weight_str
+    equipment_list.append(item)
     return 1
 
 
@@ -668,10 +958,33 @@ def create_spell(character, name, lvl, desc='', range=0, casttime='', duration=0
         'damagetype': damagetype,     
     })
 
+def _item_line(item, item_count, edition='2014'):
+    """Одна строка списка предмета: номер. название (кол-во) — стоимость, вес."""
+    name = item['name']
+    amount = item.get('amount', 1)
+    cost_dict = item.get('cost')
+    if not cost_dict and (item.get('value') or item.get('valuetype')):
+        cost_dict = {item.get('valuetype', 'зм'): item.get('value', 0)}
+    weight_str = item.get('weight_str', '')
+    cost_s = _format_item_cost(cost_dict, edition) if cost_dict else ''
+    line = f"{item_count}. {name}"
+    if amount > 1:
+        line += f" ({amount})"
+    extra = []
+    if cost_s:
+        extra.append(cost_s)
+    if weight_str:
+        extra.append(weight_str)
+    if extra:
+        line += " - " + ", ".join(extra)
+    return line + "\n"
+
+
 def show_equipment(character, show_keyboard=True):
     equipment_list = character['equipment']
     money_dict = character['money']
-    message = '---Снаряжение---\n'
+    edition = character.get('edition', '2014')
+    message = '---Экипировка---\n'
     message += f"Всего монет в золоте: {money_sum(money_dict)} зм\n\n"
 
     message += '---Предметы---\n'
@@ -680,10 +993,7 @@ def show_equipment(character, show_keyboard=True):
     for i in range(len(equipment_list)):
         if equipment_list[i]['itemtype'] == 'оружие':
             item_count += 1
-            if equipment_list[i]['amount'] > 1:
-                message += f"{item_count}. {equipment_list[i]['name']} ({equipment_list[i]['amount']})\n"
-            else:
-                message += f"{item_count}. {equipment_list[i]['name']}\n"
+            message += _item_line(equipment_list[i], item_count, edition)
             equipment_list[i]['id'] = item_count
     if item_count > 0:
         message += "\n"
@@ -691,35 +1001,26 @@ def show_equipment(character, show_keyboard=True):
     for i in range(len(equipment_list)):
         if equipment_list[i]['itemtype'] == 'броня':
             item_count += 1
-            if equipment_list[i]['amount'] > 1:
-                message += f"{item_count}. {equipment_list[i]['name']} ({equipment_list[i]['amount']})\n"
-            else:
-                message += f"{item_count}. {equipment_list[i]['name']}\n"
-            equipment_list[i]['id'] = item_count   
+            message += _item_line(equipment_list[i], item_count, edition)
+            equipment_list[i]['id'] = item_count
     if item_count > 0:
         message += "\n"
 
     for i in range(len(equipment_list)):
         if equipment_list[i]['itemtype'] == 'магия':
             item_count += 1
-            if equipment_list[i]['amount'] > 1:
-                message += f"{item_count}. {equipment_list[i]['name']} ({equipment_list[i]['amount']})\n"
-            else:
-                message += f"{item_count}. {equipment_list[i]['name']}\n"
+            message += _item_line(equipment_list[i], item_count, edition)
             equipment_list[i]['id'] = item_count
     if item_count > 0:
-            message += "\n"
-    
+        message += "\n"
+
     for i in range(len(equipment_list)):
         if equipment_list[i]['itemtype'] == 'none':
             item_count += 1
-            if equipment_list[i]['amount'] > 1:
-                message += f"{item_count}. {equipment_list[i]['name']} ({equipment_list[i]['amount']})\n"
-            else:
-                message += f"{item_count}. {equipment_list[i]['name']}\n"
+            message += _item_line(equipment_list[i], item_count, edition)
             equipment_list[i]['id'] = item_count
 
-    if show_keyboard == True:            
+    if show_keyboard == True:
         message += "\nВведите номер предмета:"
         send_message(message, keyboard_maker([["Монеты", "primary"],["Новый предмет", "primary"],["Удаление предметов", "secondary"]], keyboard_columns=2, hasbackbutton=True))
     else:
@@ -739,6 +1040,19 @@ def get_ttg_link(spellname):
         return link
     else:
         print("Символы не найдены")
+
+
+def get_dndsort_spell_link(spellname):
+    """Если в названии заклинания есть [англ. название], возвращает ссылку dndsort.ru/#spell24-engname (пробелы → дефисы). Иначе None."""
+    start = spellname.find('[')
+    end = spellname.find(']')
+    if start == -1 or end == -1 or end <= start:
+        return None
+    eng = spellname[start + 1:end].strip()
+    if not eng:
+        return None
+    engname = eng.replace(' ', '-').lower()
+    return "https://dndsort.ru/#spell24-" + engname
 
     
     
@@ -1089,7 +1403,7 @@ def get_mod(skill_name, character, get_name = False):
     else: 
         return {'mod': mod, 'check_name': name}
 
-def roll(character='none', amount = 1, die = 20, skill_name = 'none', custom_mod = 0, has_message=False, adv = ''):
+def roll(character='none', amount = 1, die = 20, skill_name = 'none', custom_mod = 0, has_message=False, adv = '', user_id=None):
     if amount < 1:
         send_message("Введите правильное число костей.")
         return
@@ -1175,6 +1489,15 @@ def roll(character='none', amount = 1, die = 20, skill_name = 'none', custom_mod
     
     if character != 'none':
         roll_message = f"{character['name']},\n"+ roll_message
+    if has_message and user_id is not None:
+        last_roll_by_user[user_id] = {
+            'character': character,
+            'amount': amount,
+            'die': die,
+            'skill_name': skill_name,
+            'custom_mod': custom_mod,
+            'adv': adv,
+        }
     if has_message:
         send_message(roll_message)
     return roll_result
@@ -1244,9 +1567,10 @@ def char_sheet_message(character): #
     else:
         xp_str = f"Опыт: {character['xp']}\n\n"
 
+    race_or_species = "Вид" if character.get('edition') == '2024' else "Раса"
     stats_msg = (
     f"Имя: {character['name']}\n"
-    f"Раса: {character['subrace']}\n"
+    f"{race_or_species}: {character['subrace']}\n"
     f"Класс: {character['class']}\n"
     f"Уровень: {character['level']}\n"
     f"{xp_str}"
@@ -1288,6 +1612,11 @@ def char_sheet_message(character): #
 
 #Генерация основных статических клавиатур
 
+def get_race_keyboard(edition='2014'):
+    """Клавиатура выбора расы в зависимости от редакции (2014 или 2024)."""
+    race_dict = dnd5e_data.races_2024 if edition == '2024' else dnd5e_data.races
+    return keyboard_maker(array_to_text_color_array(list(race_dict.values())), keyboard_columns=3, hasbackbutton=True)
+
 race_keyboard = keyboard_maker(array_to_text_color_array(list(dnd5e_data.races.values())), keyboard_columns=3, hasbackbutton=True)
 class_keyboard = keyboard_maker(array_to_text_color_array(list(dnd5e_data.classes.values())), keyboard_columns=3, hasbackbutton=True)
 
@@ -1303,20 +1632,30 @@ def create_character_flow(user_id, step, message_text, attachments=None): #со�
         return
 
     if user_id not in user_states:
-        user_states[user_id] = {'state': 'create_character', 'step': 1, 'namestate': False, 'method': 'random', 'addracebonuses': True, 'character': {}}
+        edition = get_user_edition(user_id)
+        user_states[user_id] = {'state': 'create_character', 'step': 1, 'namestate': False, 'method': 'random', 'addracebonuses': edition != '2024', 'character': {}, 'edition': edition}
     state = user_states[user_id]
+    edition = state.get('edition', get_user_edition(user_id))
+    state['edition'] = edition
+    races_data = dnd5e_data.races_2024 if edition == '2024' else dnd5e_data.races
+    race_to_subrace_data = dnd5e_data.race_to_subrace_2024 if edition == '2024' else dnd5e_data.race_to_subrace
+    r_keyboard = get_race_keyboard(edition)
+    abilities_order = ["Сила", "Ловкость", "Выносливость", "Интеллект", "Мудрость", "Харизма"]
+    point_buy_cost = {8: 0, 9: 1, 10: 2, 11: 3, 12: 4, 13: 5, 14: 7, 15: 9}
     
-    
-    if step == 1:  # Выбор расы
-        send_message("Выберите расу вашего персонажа:", race_keyboard)
+    race_label = "вид" if edition == '2024' else "расу"
+    subrace_label = "подвид" if edition == '2024' else "подрасу"
+
+    if step == 1:  # Выбор расы/вида
+        send_message(f"Выберите {race_label} вашего персонажа:", r_keyboard)
         state['step'] = 2
     
-    elif step == 2:  # Обработка выбора расы
-        if message_text.lower() in dnd5e_data.races:
-            state['character']['race'] = dnd5e_data.races[message_text.lower()]
+    elif step == 2:  # Обработка выбора расы/вида
+        if message_text.lower() in races_data:
+            state['character']['race'] = races_data[message_text.lower()]
             
-            if state['character']['race'].lower() in dnd5e_data.race_to_subrace:
-                send_message("Выберите подрасу:", keyboard_maker('subraces_list', hasbackbutton=True))
+            if state['character']['race'].lower() in race_to_subrace_data:
+                send_message(f"Выберите {subrace_label}:", keyboard_maker('subraces_list', hasbackbutton=True))
                 state['step'] = 3
             else: 
                 send_message("Выберите класс:", class_keyboard)
@@ -1326,20 +1665,21 @@ def create_character_flow(user_id, step, message_text, attachments=None): #со�
             send_message("Главное меню:", keyboards.main_keyboard)
             del user_states[user_id]
         else:
-            send_message("Пожалуйста, выберите расу из предложенных вариантов.", race_keyboard)
+            send_message(f"Пожалуйста, выберите {race_label} из предложенных вариантов.", r_keyboard)
     
-    elif step == 3:  # Обработка выбора подрасы
-        
-        if message_text.lower() in dnd5e_data.subraces:
-            state['character']['subrace'] = dnd5e_data.subraces[message_text.lower()]
+    elif step == 3:  # Обработка выбора подрасы/подвида
+        subrace_data = dnd5e_data.subraces_2024 if edition == '2024' else dnd5e_data.subraces
+
+        if message_text.lower() in subrace_data:
+            state['character']['subrace'] = subrace_data[message_text.lower()]
             send_message("Выберите класс:", class_keyboard)
             state['step'] = 4
 
         elif message_text.lower() == "назад":
-            send_message("Выберите расу вашего персонажа:", race_keyboard)
+            send_message(f"Выберите {race_label} вашего персонажа:", r_keyboard)
             state['step'] = 2
         else:
-            send_message("Пожалуйста, выберите подрасу из предложенных вариантов.", keyboard_maker('subraces_list', hasbackbutton=True))
+            send_message(f"Пожалуйста, выберите {subrace_label} из предложенных вариантов.", keyboard_maker('subraces_list', hasbackbutton=True))
         
     elif step == 4:  # Обработка выбора класса
         
@@ -1351,11 +1691,11 @@ def create_character_flow(user_id, step, message_text, attachments=None): #со�
             print(f"Введите имя:")
             state['step'] = 5
         elif message_text.lower() == "назад":
-                if state['character']['race'].lower() in dnd5e_data.race_to_subrace:
-                    send_message("Выберите подрасу:", keyboard_maker('subraces_list', hasbackbutton=True))
+                if state['character']['race'].lower() in race_to_subrace_data:
+                    send_message(f"Выберите {subrace_label}:", keyboard_maker('subraces_list', hasbackbutton=True))
                     state['step'] = 3
                 else: 
-                    send_message("Выберите расу вашего персонажа:", race_keyboard)
+                    send_message(f"Выберите {race_label} вашего персонажа:", r_keyboard)
                     state['step'] = 2
         else:
             send_message("Пожалуйста, выберите класс из предложенных вариантов.", class_keyboard)
@@ -1378,9 +1718,27 @@ def create_character_flow(user_id, step, message_text, attachments=None): #со�
         photo_att = get_photo_attachment(attachments)
         if photo_att:
             state['character']['image'] = photo_att
+            url = get_photo_url_from_attachments(attachments)
+            if url:
+                state['character']['image_url'] = url
             send_message("Картинка сохранена.")
         if photo_att or message_text == 'пропустить':
-            send_message("Хотите сгенерировать случайные характеристики или ввести вручную? (Сейчас метод генерации не работает)", keyboard_maker([["Ввести вручную","primary"]],hasbackbutton=True))
+            buttons = [
+                ["Стандартный набор", "primary"],
+                ["Случайный набор", "primary"],
+                ["Приобретение за очки", "primary"],
+                ["Ввести вручную", "secondary"],
+            ]
+            if edition != '2024':
+                buttons.append(["Не применять расовые бонусы", "secondary"])
+            send_message(
+                "Определите значения характеристик одним из способов:\n"
+                "• Стандартный набор (15, 14, 13, 12, 10, 8)\n"
+                "• Случайный набор (4d6, сумма 3 наибольших; 6 раз)\n"
+                "• Приобретение за очки (27 очков)\n"
+                "• Ввести вручную",
+                keyboard_maker(buttons, keyboard_columns=2, hasbackbutton=True),
+            )
             state['step'] = 6
         elif message_text == 'назад':
             send_message("Введите имя вашего персонажа:", keyboards.back_keyboard)
@@ -1390,105 +1748,228 @@ def create_character_flow(user_id, step, message_text, attachments=None): #со�
             send_message("Отправьте фото или нажмите «Пропустить».", keyboard_maker(array_to_text_color_array(["Пропустить"], "primary"), hasbackbutton=True))
 
     elif step == 6:  # Выбор способа создания характеристик
-        #if message_text in ['1', 'сгенерировать']:
-        if message_text == "годзилла нас съест":
-            # Генерация характеристик
-            # try:
-            #     subrace = state['character']['subrace']
-            # except KeyError:
-            #     subrace={}
-            # character = generate_character(
-            #     race=state['character']['race'],
-            #     subrace=subrace,
-            #     stats_array=[],
-            #     char_class=state['character']['class'],
-            #     prof_dict={},
-            #     name=state['character']['name'],
-            # )
-            
-            # Сохраняем персонажа
-            # save_character(user_id, character)
-            
-            # Выводим сообщение с характеристиками
-            
-            send_message(char_sheet_message(character), keyboards.main_keyboard)
-            state['step'] = 'savingthrows'
-        
-        elif message_text in ['2', 'ввести вручную']:
-            send_message("Введите характеристики в формате (расовые бонусы будут применены позже):\nСила Ловкость Выносливость Интеллект Мудрость Харизма\n\nНапример: 15 14 13 12 10 8\n\nВнимание! Если вы полуэльф, то вам нужно будет добавить еще 2 очка к вашим характеристикам по выбору (по 1 на каждую характеристику). Сделать это можно будет в редакторе персонажа.", keyboard_maker(array_to_text_color_array(["Не применять расовые бонусы"]),hasbackbutton=True))
-            state['step'] = 7
-        elif message_text == 'назад':
+        msg = message_text.strip().lower()
+        if msg == 'назад':
             send_message("Введите имя вашего персонажа:", keyboards.back_keyboard)
             state['namestate'] = True # Бот обработает имя без знаков в беседе
             print(f"Введите имя:")
             state['step'] = 5
+            return
+
+        if msg == 'не применять расовые бонусы' and edition != '2024':
+            state['addracebonuses'] = False
+            buttons = [
+                ["Стандартный набор", "primary"],
+                ["Случайный набор", "primary"],
+                ["Приобретение за очки", "primary"],
+                ["Ввести вручную", "secondary"],
+                ["Не применять расовые бонусы", "secondary"],
+            ]
+            send_message(
+                "Хорошо. Расовые бонусы к характеристикам применяться не будут.\n\nВыберите способ создания характеристик:",
+                keyboard_maker(buttons, keyboard_columns=2, hasbackbutton=True),
+            )
+            return
+
+        if msg in ('ввести вручную',):
+            hint = "Введите характеристики в формате:\n\n" + " ".join(abilities_order) + "\n\nНапример: 15 14 13 12 10 8"
+            if edition != '2024' and state.get('addracebonuses', True):
+                hint = (
+                    "Введите характеристики в формате (расовые бонусы будут применены позже):\n"
+                    + " ".join(abilities_order)
+                    + "\n\nНапример: 15 14 13 12 10 8"
+                    + "\n\nЕсли вы полуэльф, +2 очка по выбору (+1 к двум характеристикам) можно будет добавить в редакторе персонажа."
+                )
+            send_message(hint, keyboard_maker(array_to_text_color_array(["Назад"], "secondary")))
+            state['step'] = 'stats_manual'
+            return
+
+        if msg in ('стандартный набор',):
+            pool = [15, 14, 13, 12, 10, 8]
+            state['stats_pool'] = pool
+            send_message(
+                "Получены значения: " + ", ".join(map(str, pool)) + "\n\n"
+                "Теперь распределите их по характеристикам.\n"
+                "Введите 6 чисел в порядке:\n"
+                + " ".join(abilities_order)
+                + "\n\nНапример: 15 14 13 12 10 8",
+                keyboard_maker(array_to_text_color_array(["Назад"], "secondary")),
+            )
+            state['step'] = 'stats_assign'
+            return
+
+        if msg in ('случайный набор',):
+            pool = []
+            for _ in range(6):
+                rolls = [random.randint(1, 6) for _ in range(4)]
+                rolls.remove(min(rolls))
+                pool.append(sum(rolls))
+            state['stats_pool'] = pool
+            send_message(
+                "Случайный набор (4d6, сумма 3 наибольших) дал значения:\n"
+                + ", ".join(map(str, pool))
+                + "\n\nТеперь распределите их по характеристикам.\n"
+                "Введите 6 чисел в порядке:\n"
+                + " ".join(abilities_order)
+                + "\n\nПример: 15 14 13 12 10 8",
+                keyboard_maker(array_to_text_color_array(["Назад"], "secondary")),
+            )
+            state['step'] = 'stats_assign'
+            return
+
+        if msg in ('приобретение за очки', 'приобр за очки', 'point buy (27)', 'point buy', 'поинт бай', 'покупка за очки'):
+            send_message(
+                "Приобретение за очки: у вас 27 очков. Введите 6 значений (8–15) в порядке:\n"
+                + " ".join(abilities_order)
+                + "\n\nНапример: 15 14 13 12 10 8\n\n"
+                "Стоимость: 8=0, 9=1, 10=2, 11=3, 12=4, 13=5, 14=7, 15=9.\n"
+                "Сумма стоимости должна быть ≤ 27.",
+                keyboard_maker(array_to_text_color_array(["Назад"], "secondary")),
+            )
+            state['step'] = 'stats_point_buy'
+            return
+
         else:
-            #send_message("Пожалуйста, выберите вариант:", keyboard_maker([["Сгенерировать","primary"],["Ввести вручную","primary"]],hasbackbutton=True))
-            send_message("Пожалуйста, выберите вариант:", keyboard_maker([["Ввести вручную","primary"]],hasbackbutton=True))
-    
-    elif step == 7:  # Ручной ввод характеристик
-            if message_text == 'назад':
-                #send_message("Хотите сгенерировать случайные характеристики или ввести вручную?", keyboard_maker([["Сгенерировать","primary"],["Ввести вручную","primary"]],hasbackbutton=True))
-                send_message("Хотите сгенерировать случайные характеристики или ввести вручную? (Сейчас метод генерации не работает)", keyboard_maker([["Ввести вручную","primary"]],hasbackbutton=True))
-                state['step'] = 6
-            
+            buttons = [
+                ["Стандартный набор", "primary"],
+                ["Случайный набор", "primary"],
+                ["Приобретение за очки", "primary"],
+                ["Ввести вручную", "secondary"],
+            ]
+            if edition != '2024':
+                buttons.append(["Не применять расовые бонусы", "secondary"])
+            send_message("Пожалуйста, выберите вариант из меню:", keyboard_maker(buttons, keyboard_columns=2, hasbackbutton=True))
 
-            elif message_text == 'не применять расовые бонусы':
-                send_message("Хорошо. Введите характеристики в формате (расовые бонусы не будут применены к вашим значениям):\n\nСила Ловкость Выносливость Интеллект Мудрость Харизма\n\nНапример: 15 14 13 12 10 8", keyboard_maker(array_to_text_color_array(["Назад"], "secondary")))
-                state['step'] = 8
-            else:
-                try:    
-                    stats = list(map(int, message_text.split()))
-                    if len(stats) != 6:
-                        raise ValueError
-                    
-                    
-                    state['character']['stats'] = stats
-                    state['method'] = 'manual'
-                    
-                    next_message = "Выберите умения в испытаниях через пробел, например:\n\n1 3\n\n"
-                    saves_array = list(dnd5e_data.abilities.values())
-                    for i in range(len(saves_array)):
-                        next_message += f"{i+1}. {saves_array[i]}\n"
-                    send_message(next_message, keyboards.back_keyboard)
-
-                    state['step'] = 'savingthrows'
-                except ValueError:
-                    send_message("Некорректный формат. Введите 6 чисел через пробел, например:\n\n15 14 13 12 10 8", keyboard_maker(array_to_text_color_array(["Не применять расовые бонусы"]),hasbackbutton=True))
-            
-            
-        
-
-    elif step == 8:  # Ручной ввод характеристик без прибавления бонусов
+    elif step == 'stats_assign':  # Распределение полученных значений по характеристикам
+        if message_text.strip().lower() == 'назад':
+            state.pop('stats_pool', None)
+            buttons = [
+                ["Стандартный набор", "primary"],
+                ["Случайный набор", "primary"],
+                ["Приобретение за очки", "primary"],
+                ["Ввести вручную", "secondary"],
+            ]
+            if edition != '2024':
+                buttons.append(["Не применять расовые бонусы", "secondary"])
+            send_message("Выберите способ создания характеристик:", keyboard_maker(buttons, keyboard_columns=2, hasbackbutton=True))
+            state['step'] = 6
+            return
         try:
-            if message_text != 'назад' and message_text != 'не применять расовые бонусы':
-                stats = list(map(int, message_text.split()))
-                if len(stats) != 6:
-                    raise ValueError
-                
-                state['character']['stats'] = stats
-                state['method'] = 'manual'
-                state['addracebonuses'] = False
-                
-                # send_message(char_sheet_message(character), keyboards.main_keyboard)
-                # del user_states[user_id]
-                next_message = "Выберите умения в испытаниях через пробел, например:\n\n1 3\n\n"
-                saves_array = list(dnd5e_data.abilities.values())
-                for i in range(len(saves_array)):
-                    next_message += f"{i+1}. {saves_array[i]}\n"
-                send_message(next_message, keyboards.back_keyboard)
-                state['step'] = 'savingthrows'
+            stats = list(map(int, message_text.replace(',', ' ').split()))
+            if len(stats) != 6:
+                raise ValueError
+            pool = state.get('stats_pool')
+            if not pool:
+                raise ValueError
+            if sorted(stats) != sorted(pool):
+                send_message(
+                    "Значения не совпадают с полученным набором.\n"
+                    "Получены: " + ", ".join(map(str, pool)) + "\n"
+                    "Введите 6 чисел (в любом порядке), распределив их как:\n"
+                    + " ".join(abilities_order),
+                    keyboard_maker(array_to_text_color_array(["Назад"], "secondary")),
+                )
+                return
+            state['character']['stats'] = stats
+            state['method'] = 'manual'
+            state.pop('stats_pool', None)
 
-            elif message_text == 'назад':
-                #send_message("Хотите сгенерировать случайные характеристики или ввести вручную?", keyboard_maker([["Сгенерировать","primary"],["Ввести вручную","primary"]],hasbackbutton=True))
-                send_message("Хотите сгенерировать случайные характеристики или ввести вручную? (Сейчас метод генерации не работает)", keyboard_maker([["Ввести вручную","primary"]],hasbackbutton=True))
-                state['step'] = 6
-            else:
-                send_message("Введите характеристики в формате (расовые бонусы не будут применены к вашим значениям):\n\nСила Ловкость Выносливость Интеллект Мудрость Харизма\n\nНапример: 15 14 13 12 10 8", keyboard_maker(array_to_text_color_array(["Назад"], "secondary")))
-                state['step'] = 8
-
+            next_message = "Выберите умения в испытаниях через пробел, например:\n\n1 3\n\n"
+            saves_array = list(dnd5e_data.abilities.values())
+            for i in range(len(saves_array)):
+                next_message += f"{i+1}. {saves_array[i]}\n"
+            send_message(next_message, keyboards.back_keyboard)
+            state['step'] = 'savingthrows'
         except ValueError:
-            send_message("Некорректный формат. Введите 6 чисел через пробел, например:\n\n15 14 13 12 10 8", keyboard_maker(array_to_text_color_array(["Назад"],'secondary')))
+            send_message(
+                "Некорректный формат. Введите 6 чисел через пробел или запятую в порядке:\n"
+                + " ".join(abilities_order)
+                + "\n\nНапример: 15 14 13 12 10 8",
+                keyboard_maker(array_to_text_color_array(["Назад"], "secondary")),
+            )
+
+    elif step == 'stats_point_buy':  # Приобретение за очки (27)
+        if message_text.strip().lower() == 'назад':
+            buttons = [
+                ["Стандартный набор", "primary"],
+                ["Случайный набор", "primary"],
+                ["Приобретение за очки", "primary"],
+                ["Ввести вручную", "secondary"],
+            ]
+            if edition != '2024':
+                buttons.append(["Не применять расовые бонусы", "secondary"])
+            send_message("Выберите способ создания характеристик:", keyboard_maker(buttons, keyboard_columns=2, hasbackbutton=True))
+            state['step'] = 6
+            return
+        try:
+            stats = list(map(int, message_text.replace(',', ' ').split()))
+            if len(stats) != 6:
+                raise ValueError
+            if any(s not in point_buy_cost for s in stats):
+                send_message(
+                    "Можно использовать только значения 8–15.\n"
+                    "Стоимость: 8=0, 9=1, 10=2, 11=3, 12=4, 13=5, 14=7, 15=9.\n"
+                    "Введите 6 значений в порядке:\n" + " ".join(abilities_order),
+                    keyboard_maker(array_to_text_color_array(["Назад"], "secondary")),
+                )
+                return
+            spent = sum(point_buy_cost[s] for s in stats)
+            if spent > 27:
+                send_message(
+                    f"Слишком дорого: {spent} очков (лимит 27). Попробуйте ещё раз.\n"
+                    "Введите 6 значений в порядке:\n" + " ".join(abilities_order),
+                    keyboard_maker(array_to_text_color_array(["Назад"], "secondary")),
+                )
+                return
+            state['character']['stats'] = stats
+            state['method'] = 'manual'
+
+            next_message = f"Приобретение за очки: потрачено {spent}/27.\n\n"
+            next_message += "Выберите умения в испытаниях через пробел, например:\n\n1 3\n\n"
+            saves_array = list(dnd5e_data.abilities.values())
+            for i in range(len(saves_array)):
+                next_message += f"{i+1}. {saves_array[i]}\n"
+            send_message(next_message, keyboards.back_keyboard)
+            state['step'] = 'savingthrows'
+        except ValueError:
+            send_message(
+                "Некорректный формат. Введите 6 чисел (8–15) через пробел или запятую в порядке:\n"
+                + " ".join(abilities_order)
+                + "\n\nПример: 15 14 13 12 10 8",
+                keyboard_maker(array_to_text_color_array(["Назад"], "secondary")),
+            )
+
+    elif step == 'stats_manual':  # Ручной ввод характеристик
+        if message_text.strip().lower() == 'назад':
+            buttons = [
+                ["Стандартный набор", "primary"],
+                ["Случайный набор", "primary"],
+                ["Приобретение за очки", "primary"],
+                ["Ввести вручную", "secondary"],
+            ]
+            if edition != '2024':
+                buttons.append(["Не применять расовые бонусы", "secondary"])
+            send_message("Выберите способ создания характеристик:", keyboard_maker(buttons, keyboard_columns=2, hasbackbutton=True))
+            state['step'] = 6
+            return
+        try:
+            stats = list(map(int, message_text.replace(',', ' ').split()))
+            if len(stats) != 6:
+                raise ValueError
+            state['character']['stats'] = stats
+            state['method'] = 'manual'
+
+            next_message = "Выберите умения в испытаниях через пробел, например:\n\n1 3\n\n"
+            saves_array = list(dnd5e_data.abilities.values())
+            for i in range(len(saves_array)):
+                next_message += f"{i+1}. {saves_array[i]}\n"
+            send_message(next_message, keyboards.back_keyboard)
+            state['step'] = 'savingthrows'
+        except ValueError:
+            send_message(
+                "Некорректный формат. Введите 6 чисел через пробел или запятую, например:\n\n15 14 13 12 10 8",
+                keyboard_maker(array_to_text_color_array(["Назад"], "secondary")),
+            )
 
 
     elif step == 'savingthrows':
@@ -1523,8 +2004,15 @@ def create_character_flow(user_id, step, message_text, attachments=None): #со�
                 send_message(next_message, keyboards.back_keyboard)
 
         else:
-            #send_message("Хотите сгенерировать случайные характеристики или ввести вручную?", keyboard_maker([["Сгенерировать","primary"],["Ввести вручную","primary"]],hasbackbutton=True))
-            send_message("Хотите сгенерировать случайные характеристики или ввести вручную? (Сейчас метод генерации не работает)", keyboard_maker([["Ввести вручную","primary"]],hasbackbutton=True))
+            buttons = [
+                ["Стандартный набор", "primary"],
+                ["Случайный набор", "primary"],
+                ["Приобретение за очки", "primary"],
+                ["Ввести вручную", "secondary"],
+            ]
+            if edition != '2024':
+                buttons.append(["Не применять расовые бонусы", "secondary"])
+            send_message("Выберите способ создания характеристик:", keyboard_maker(buttons, keyboard_columns=2, hasbackbutton=True))
             state['step'] = 6
 
 
@@ -1611,6 +2099,8 @@ def create_character_flow(user_id, step, message_text, attachments=None): #со�
                     }
                 )
                 character['image'] = state['character'].get('image', '')
+                character['image_url'] = state['character'].get('image_url', '')
+                character['edition'] = edition
 
                 # Сохраняем персонажа
                 save_character(user_id, character)
@@ -1699,7 +2189,7 @@ def manage_character_flow(user_id, step, message_text, attachments=None): #уп�
         elif message_text == 'навыки':
             show_all_skills(state['character'])
 
-        elif message_text == 'снаряжение':
+        elif message_text in ('снаряжение', 'экипировка'):
             state['step'] = 'equipment'
             show_equipment(state['character'])
         
@@ -1761,7 +2251,12 @@ def manage_character_flow(user_id, step, message_text, attachments=None): #уп�
 
         elif message_text == 'новый предмет':
             state['step'] = 'newitem'
-            send_message('Укажите имена новых предметов (можно ввести несколько, каждый на новой строке):', keyboards.back_keyboard)
+            send_message(
+                'Введите предметы через запятую или по одному на строке.\n'
+                'Формат: название [количество] [вес] [стоимость]\n'
+                'Пример: 5 Кинжал, рубин 5 фунтов (50 зм), ложка 1 фунт, зелье лечения 14, камень 14 зм',
+                keyboards.back_keyboard,
+            )
         elif message_text == 'удаление предметов':
             if len(state['character']['equipment']) > 0:
                 send_message('Укажите через пробел номера предметов, которые хотите удалить, например:\n\n1 3 7 14', keyboards.back_keyboard)
@@ -1780,35 +2275,30 @@ def manage_character_flow(user_id, step, message_text, attachments=None): #уп�
             state['step'] = 'equipment'
         else:
             character = state['character']
-            items = original_message_text.split('\n')  
-            try:     
-                for i in range(len(items)):
-                    item = items[i].split(" ")
-                    count = 1
-                    last = item[-1]
-                    print(last)
-                    if item[-1].isdigit():
-                        if int(item[-1]) > 0:
-                            count = int(item[-1])
-                            item.pop(-1)
-                        else:
-                            raise ValueError
-                    # for i in range(len(item)):
-                    #     if item[i][-2:] in ['зм','см','мм','эм','пм']:
-
-                    name = ''
-                    for i in range(len(item)):
-                        name += item[i]
-                        name += " "
-                    name = name.rstrip()
-                    create_item(character,name=name,amount=count)                    
+            try:
+                parsed_items = []
+                for line in original_message_text.split('\n'):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parsed_items.extend(parse_equipment_bulk(line))
+                if not parsed_items:
+                    raise ValueError("Не найдено ни одного предмета.")
+                for it in parsed_items:
+                    create_item(
+                        character,
+                        name=it['name'],
+                        amount=it['amount'],
+                        cost=it['cost'] if it.get('cost') else None,
+                        weight_str=it.get('weight_str', ''),
+                    )
                 replace_char(character, state['all_characters'])
                 write_characters(user_id, state['all_characters'])
                 send_message('Предметы успешно добавлены.')
                 state['step'] = 'equipment'
                 show_equipment(character)
-            except ValueError:
-                send_message("Неверный формат. Повторите попытку.")
+            except ValueError as e:
+                send_message(str(e) if str(e) else "Неверный формат. Повторите попытку.")
 
     elif step == 'deleteitems':
         if message_text == 'назад':
@@ -2044,6 +2534,9 @@ def manage_character_flow(user_id, step, message_text, attachments=None): #уп�
         photo_att = get_photo_attachment(attachments)
         if photo_att:
             change_param(state['character'], 'image', photo_att, state['all_characters'])
+            url = get_photo_url_from_attachments(attachments)
+            if url:
+                change_param(state['character'], 'image_url', url, state['all_characters'])
             send_message("Картинка персонажа обновлена.")
             message = char_sheet_message(state['character'])
             att = state['character'].get('image') or None
@@ -2233,7 +2726,7 @@ def manage_character_flow(user_id, step, message_text, attachments=None): #уп�
     elif step == 'editstats':
         try:
             if message_text != 'назад':
-                stats = list(map(int, message_text.split()))
+                stats = list(map(int, message_text.replace(',', ' ').split()))
                 if len(stats) != 6:
                     raise ValueError
                 stats_dict = {
@@ -2795,15 +3288,15 @@ def roll_complex_dice(dice_terms, total_mod, has_message=False):
 # Справка по командам (краткое описание и ключи для детальной помощи)
 HELP_TOPICS = {
     'нап': ('Напарник (нап, напар)', (
-        "Напарник — компаньон с короткой кличкой.\n\n"
+        "Напарник — компаньон с короткой кличкой. Все команды — раздельными словами.\n\n"
         "• Список: нап / напарник / напар (без аргументов)\n"
-        "• Добавить: нап <имя> <кличка>, например: нап Римус рим\n"
-        "• Удалить: напудалить <кличка> или напуд <кличка>, например: напуд рим\n"
-        "• Карточка: /кличка. Уровень: /кличкаур, /кличкауровень, /кличкауров <число>\n"
-        "• Инициатива: кличкамини <число>. ПЗ: кличкапз ±число. Макс. ПЗ: кличкамакс / кличкампз <число>\n"
-        "• КБ: кличкакб <число>. Бонус атаки: кличкаатк <число>; бросок атаки: кличкаатк\n"
-        "• Испытания: кличкаисплов, кличкаиспсил, кличкаиспвын, кличкаиспинт, кличкаиспмуд, кличкаиспхар\n"
-        "• Навыки: кличка + код + число (римлов 5, римсил -1)"
+        "• Добавить: нап <имя> [кличка], например: нап Римус рим\n"
+        "• Удалить: нап уд [кличка] или нап удалить [кличка], например: нап уд рим\n"
+        "• Карточка: введите только кличку (например: рим)\n"
+        "• Инициатива: [кличка] ини <число>. ПЗ: [кличка] пз ±число. Макс. ПЗ: [кличка] макс / [кличка] мпз <число>\n"
+        "• КБ: [кличка] кб <число>. Бонус атаки: [кличка] атк <число>; бросок атаки: [кличка] атк\n"
+        "• Испытания: [кличка] исп лов | исп сил | исп вын | исп инт | исп муд | исп хар (например: рим исп лов)\n"
+        "• Навыки: [кличка] <код> [число], например: рим лов 5, рим сил -1, рим лов (бросок)"
     )),
     'справка': ('Справка dndsort.ru (справ, dnd, спр)', (
         "Поиск по справочнику: справка <запрос> или справ / dnd / спр.\n"
@@ -2814,11 +3307,17 @@ HELP_TOPICS = {
         "• Формула XdY: 2d6, d20, 10d100. С модификатором: 3d20+4.\n"
         "• Несколько модификаторов суммируются: 3d20+4+8 = 3d20+12.\n"
         "• Несколько костей: d20+d4, 2d6+3d4+5.\n"
-        "• По характеристикам: кодовое слово (сил, лов, про и т.д.). Помеха: пом лов. Преимущество: пре лов."
+        "• По характеристикам: одно слово (сил, лов, про и т.д.). Испытания: исп лов, исп сил, исп вын, исп инт, исп муд, исп хар.\n"
+        "• Помеха: пом лов. Преимущество: пре лов."
     )),
     'инициатива': ('Инициатива (ини, иниц)', (
         "Команда ини / инициатива бросает инициативу за основного персонажа и всех напарников.\n"
         "В одном сообщении выводятся имя, бросок и результат для каждого."
+    )),
+    'вдох': ('Вдохновение (вдох, +вдох, -вдох)', (
+        "• вдох — показать, есть ли у персонажа вдохновение.\n"
+        "• +вдох — получить вдохновение (установить наличие).\n"
+        "• -вдох — потратить вдохновение: перебросить последнюю кость с теми же модификаторами. Если вдохновения нет или не было броска — выдаётся сообщение."
     )),
     'персонажи': ('Персонажи и меню', (
         "• Создать персонажа — начать создание.\n"
@@ -2829,6 +3328,11 @@ HELP_TOPICS = {
         "Помощь — показать список команд.\n"
         "Помощь <команда> — подробная справка по команде, например: помощь нап.\n"
         "Команда «пом» используется только для броска с помехой (пом лов, пом про и т.д.)."
+    )),
+    'редакция': ('Редакция (2014 / 2024)', (
+        "Редакция — выбор правил для создания персонажей.\n\n"
+        "• 2014 — классические расы PHB с расовыми бонусами к характеристикам и подрасами.\n"
+        "• 2024 — виды из PHB 2024 (Аасимар, Дварф, Драконорождённый, Гном, Голиаф, Орк, Полурослик, Тифлинг, Человек, Эльф); расовые бонусы к характеристикам не применяются."
     )),
 }
 
@@ -2851,7 +3355,7 @@ def show_help(message_id, topic=None):
         send_message("\n".join(lines), keyboards.main_keyboard)
     except Exception as e:
         print("show_help error:", e)
-        send_message("Список команд: Создать персонажа, Мои персонажи, Помощь, Напарник (нап), Справка (справ/dnd/спр), Кубики XdY и по навыкам, Инициатива (ини). Напишите «помощь команда» для подробностей.")
+        send_message("Список команд: Создать персонажа, Мои персонажи, Редакция (2014/2024), Помощь, Напарник (нап), Справка (справ/dnd/спр), Кубики XdY и по навыкам, Инициатива (ини). Напишите «помощь команда» для подробностей.")
 
 # Основной цикл бота
 for event in longpoll.listen():
@@ -2900,14 +3404,16 @@ for event in longpoll.listen():
                                 for s in spells:
                                     if s.get('id') == num:
                                         name = s.get('name', '')
-                                        # Русская часть названия (до " [english]") для поиска на сайте
-                                        if ' [' in name:
-                                            search_name = name.split(' [')[0].strip()
-                                        else:
-                                            search_name = name
-                                        if search_name and len(search_name) > 1 and search_name[0].isdigit() and search_name[1:2].isspace():
-                                            search_name = search_name[2:].strip()
-                                        link = "https://dndsort.ru/#" + quote(search_name or name, safe='')
+                                        # Если есть [англ. название] — ссылка dndsort.ru/#spell24-engname (дефисы вместо пробелов)
+                                        link = get_dndsort_spell_link(name)
+                                        if link is None:
+                                            if ' [' in name:
+                                                search_name = name.split(' [')[0].strip()
+                                            else:
+                                                search_name = name
+                                            if search_name and len(search_name) > 1 and search_name[0].isdigit() and search_name[1:2].isspace():
+                                                search_name = search_name[2:].strip()
+                                            link = "https://dndsort.ru/#" + quote(search_name or name, safe='')
                                         send_message(link)
                                         dnd_ref_handled = True
                                         break
@@ -2941,25 +3447,24 @@ for event in longpoll.listen():
         if msg_stripped in ('напарник', 'нап', 'напар'):
             send_message(companions_list_text(companions))
             continue
-        # Удалить напарника: напудалить <кличка> / напуд <кличка>
-        if msg_stripped.startswith("напудалить "):
-            nick = msg_stripped[10:].strip().lower()
-        elif msg_stripped.startswith("напуд "):
-            nick = msg_stripped[6:].strip().lower()
+        # Удалить напарника: нап уд [кличка] / нап удалить [кличка]
+        _words = msg_stripped.split()
+        if len(_words) >= 3 and _words[0] == 'нап' and _words[1] in ('уд', 'удалить'):
+            nick = _words[2].lower()
         else:
             nick = None
         if nick is not None:
             if not nick:
-                send_message("Укажите кличку: напудалить <кличка> или напуд <кличка>, например: напуд рим")
+                send_message("Укажите кличку: нап уд [кличка] или нап удалить [кличка], например: нап уд рим")
             elif nick in companions:
                 name = companions[nick]['name']
                 del companions[nick]
                 save_companions(user_id, companions)
                 send_message(f"Напарник «{name}» (кличка {nick}) удалён.")
             else:
-                send_message("Нет напарника с такой кличкой. Удаление: напудалить <кличка> или напуд <кличка>")
+                send_message("Нет напарника с такой кличкой. Удаление: нап уд [кличка] или нап удалить [кличка]")
             continue
-        # Добавить напарника: "напарник Имя кличка" / "нап Имя кличка" / "напар Имя кличка"
+        # Добавить напарника: "напарник Имя [кличка]" / "нап Имя [кличка]" / "напар Имя [кличка]"
         for add_cmd in ('напарник ', 'нап ', 'напар '):
             if msg_stripped.startswith(add_cmd):
                 rest = original_message_text.strip()[len(add_cmd):].strip().split()
@@ -2983,91 +3488,79 @@ for event in longpoll.listen():
         if msg_stripped in companions:
             send_message(companion_card_text(companions[msg_stripped]))
             continue
-        # Команды напарника: испытания (римисплов), атака (риматк), кличка + суффикс + число
-        for nick in sorted(companions.keys(), key=len, reverse=True):
-            if not msg_stripped.startswith(nick):
-                continue
-            rest = msg_stripped[len(nick):].strip().replace(" ", "")
-            if not rest:
-                continue
+        # Команды напарника (раздельные слова): [кличка] исп лов, [кличка] атк, [кличка] ини 5 и т.д.
+        _words = msg_stripped.split()
+        if len(_words) >= 2 and _words[0] in companions:
+            nick = _words[0]
+            rest_words = _words[1:]
             comp = companions[nick]
             matched = False
-            # Испытание: кличка + исплов / испсил / испвын / испинт / испмуд / испхар
-            if rest in COMPANION_TRIAL_SUFFIXES:
-                code = rest[3:]  # лов, сил, вын, инт, муд, хар
+            # Испытание: [кличка] исп <характеристика> (например: рим исп лвк, рим испытание мудрость)
+            if len(rest_words) == 2 and rest_words[0] in ('исп', 'испытание') and rest_words[1] in COMPANION_TRIAL_CODE_MAP:
+                code = COMPANION_TRIAL_CODE_MAP[rest_words[1]]
                 mod = comp.get('skills', {}).get(code, 0)
                 roll_val = random.randint(1, 20)
-                name_trial = COMPANION_TRIAL_NAMES.get(rest, rest)
+                name_trial = COMPANION_TRIAL_NAMES.get(code, code)
                 send_message(format_companion_roll(comp['name'], name_trial, roll_val, mod))
                 matched = True
-            # Атака: кличка + атк/атак без числа — бросок атаки
-            elif rest in ('атк', 'атак'):
+            # Атака: [кличка] атк / [кличка] атак
+            elif len(rest_words) == 1 and rest_words[0] in ('атк', 'атак'):
                 mod = comp['attack_bonus']
                 roll_val = random.randint(1, 20)
                 send_message(format_companion_roll(comp['name'], 'Атака', roll_val, mod))
                 matched = True
-            if matched:
-                companion_handled = True
-                break
-            for suf in sorted(COMPANION_STAT_SUFFIXES, key=len, reverse=True):
-                if not rest.startswith(suf):
-                    continue
-                val_part = rest[len(suf):].strip().lstrip('+')
+            # Остальные команды: [кличка] суффикс [число]
+            elif rest_words and rest_words[0] in COMPANION_STAT_SUFFIXES:
+                suf = rest_words[0]
                 try:
-                    val = int(val_part) if val_part else None
-                except ValueError:
+                    val = int(rest_words[1]) if len(rest_words) > 1 else None
+                except (ValueError, IndexError):
                     val = None
-                if suf == 'мини':
+                if suf == 'ини':
                     if val is not None:
                         comp['initiative'] = val
                         send_message(f"{comp['name']}: инициатива {val:+d}.")
                     else:
-                        send_message("Укажите число: кличкамини <число>, например: римини 1")
+                        send_message("Укажите число: [кличка] ини <число>, например: рим ини 1")
                     matched = True
-                    break
-                if suf in ('пз',):
+                elif suf in ('пз',):
                     if val is not None:
                         comp['hp'] = max(0, min(comp['max_hp'], comp['hp'] + val))
                         send_message(f"{comp['name']}: ПЗ теперь {comp['hp']}/{comp['max_hp']}.")
                     else:
-                        send_message("Укажите число: кличкапз ±число, например: римпз -5")
+                        send_message("Укажите число: [кличка] пз ±число, например: рим пз -5")
                     matched = True
-                    break
-                if suf in ('макс', 'мпз'):
+                elif suf in ('макс', 'мпз'):
                     if val is not None:
                         comp['max_hp'] = max(1, val)
                         if comp['hp'] > comp['max_hp']:
                             comp['hp'] = comp['max_hp']
                         send_message(f"{comp['name']}: макс. ПЗ = {comp['max_hp']}.")
                     else:
-                        send_message("Укажите число: кличкамакс <число> или кличкампз <число>")
+                        send_message("Укажите число: [кличка] макс <число> или [кличка] мпз <число>")
                     matched = True
-                    break
-                if suf == 'кб':
+                elif suf == 'кб':
                     if val is not None:
                         comp['ac'] = val
                         send_message(f"{comp['name']}: КБ = {val}.")
                     else:
-                        send_message("Укажите число: кличкакб <число>")
+                        send_message("Укажите число: [кличка] кб <число>")
                     matched = True
-                    break
-                if suf in ('атак', 'атк'):
+                elif suf in ('атак', 'атк'):
                     if val is not None:
                         comp['attack_bonus'] = val
                         send_message(f"{comp['name']}: бонус атаки {val:+d}.")
                     else:
-                        send_message("Бросок атаки: кличкаатк. Изменить бонус: кличкаатк <число>, например: риматк 3")
+                        send_message("Бросок атаки: [кличка] атк. Изменить бонус: [кличка] атк <число>, например: рим атк 3")
                     matched = True
-                    break
-                if suf in ('уров', 'ур', 'уровень'):
+                elif suf in ('уров', 'ур', 'уровень'):
                     if val is not None:
                         comp['level'] = max(1, min(20, val))
                         send_message(f"{comp['name']}: уровень {comp['level']}.")
                     else:
-                        send_message("Укажите число: кличкаур / кличкауров / кличкауровень <число>")
+                        send_message("Укажите число: [кличка] ур / [кличка] уров / [кличка] уровень <число>")
                     matched = True
-                    break
-                if suf in COMPANION_STAT_SUFFIXES:
+                elif suf in COMPANION_STAT_SUFFIXES:
                     if val is not None:
                         if 'skills' not in comp:
                             comp['skills'] = {}
@@ -3076,18 +3569,15 @@ for event in longpoll.listen():
                         skill_name = COMPANION_SKILL_DISPLAY.get(suf, suf)
                         send_message(f"{comp['name']}: {skill_name} {val:+d}.")
                     else:
-                        # Бросок по навыку: кличкалов без числа — d20 + бонус (если не задан, +0)
                         storage_key = COMPANION_SKILL_STORAGE_KEY(suf)
                         mod = comp.get('skills', {}).get(storage_key, 0)
                         roll_val = random.randint(1, 20)
                         check_name = COMPANION_CHECK_NAMES.get(suf, COMPANION_SKILL_DISPLAY.get(suf, suf))
                         send_message(format_companion_roll(comp['name'], check_name, roll_val, mod))
                     matched = True
-                    break
             if matched:
                 save_companions(user_id, companions)
                 companion_handled = True
-                break
         if companion_handled:
             continue
 
@@ -3154,15 +3644,53 @@ for event in longpoll.listen():
                 main_menu_message()
                 continue
         if user_id in user_states:
-            print(user_states[user_id]['step'])
             attachments = event.obj.message.get('attachments', [])
+            if user_states[user_id]['state'] == 'choose_edition':
+                if message_text == '2014':
+                    set_user_edition(user_id, '2014')
+                    send_message("Редакция правил: 2014. Создание персонажей будет по правилам 2014 года.", keyboards.main_keyboard)
+                    del user_states[user_id]
+                elif message_text == '2024':
+                    set_user_edition(user_id, '2024')
+                    send_message("Редакция правил: 2024. Создание персонажей будет по правилам 2024 года (виды из PHB 2024, без расовых бонусов к характеристикам).", keyboards.main_keyboard)
+                    del user_states[user_id]
+                elif message_text.lower() == 'назад':
+                    send_message("Главное меню:", keyboards.main_keyboard)
+                    del user_states[user_id]
+                else:
+                    send_message("Выберите редакцию: 2014 или 2024.", keyboards.edition_keyboard)
+                continue
+            print(user_states[user_id]['step'])
             if user_states[user_id]['state'] == 'create_character':
                 create_character_flow(user_id, user_states[user_id]['step'], message_text, attachments)
             elif user_states[user_id]['state'] == 'manage_character':
                 manage_character_flow(user_id, user_states[user_id]['step'], message_text, attachments)
-                # elif user_states['state'] ==
-                # elif user_states['state'] ==
 
+            continue
+
+        # Вдохновение: вдох (показать), +вдох (получить), -вдох (переброс последней кости)
+        if msg_stripped in ('вдох', '+вдох', '-вдох'):
+            try:
+                char = load_main_character(user_id)
+            except (IndexError, TypeError):
+                send_message("Персонаж не подключен. Создайте или выберите персонажа.")
+                continue
+            if msg_stripped == 'вдох':
+                send_message("Вдохновение: ✨" if char['inspiration'] else "Вдохновение: нет")
+            elif msg_stripped == '+вдох':
+                change_param(char, 'inspiration', True)
+                send_message("Вдохновение получено. ✨")
+            else:  # -вдох
+                if not char['inspiration']:
+                    send_message("Вдохновения нет.")
+                    continue
+                last = last_roll_by_user.get(user_id)
+                if not last:
+                    send_message("Не было броска для переброса. Сначала сделайте бросок (например, проверку или d20).")
+                    continue
+                change_param(char, 'inspiration', False)
+                roll(character=last['character'], amount=last['amount'], die=last['die'], skill_name=last['skill_name'],
+                     custom_mod=last['custom_mod'], has_message=True, adv=last['adv'], user_id=user_id)
             continue
 
         # Сложные формулы: несколько костей (d20+d4) или несколько модификаторов (3d20+4+8 → 3d20+12)
@@ -3200,7 +3728,7 @@ for event in longpoll.listen():
                     die = int(parts[1])
 
                 characters = load_characters(user_id)
-                roll(characters[get_main_char_id(user_id) - 1], amount, die, has_message=True, custom_mod = mod)
+                roll(characters[get_main_char_id(user_id) - 1], amount, die, has_message=True, custom_mod = mod, user_id=user_id)
                 continue
             except ValueError:
                 send_message("Пожалуйста, введите правильное значение кости в формате XdY.", keyboards.main_keyboard)
@@ -3208,70 +3736,346 @@ for event in longpoll.listen():
                 if not user_id in user_warnings:
                     send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.")
                     user_warnings[user_id] = ''
-                roll(character='none', amount=amount, die=die, has_message=True, custom_mod=mod)
+                roll(character='none', amount=amount, die=die, has_message=True, custom_mod=mod, user_id=user_id)
                 continue
             continue
         
+        # Бросок по испытанию: раздельные команды «исп лвк», «исп ловкость», «испытание муд» и т.д.
+        _roll_words = msg_stripped.split()
+        if len(_roll_words) == 2 and _roll_words[0] in ('исп', 'испытание'):
+            _trial_map = {
+                'сил': 'испсил', 'сила': 'испсил',
+                'лвк': 'исплвк', 'лов': 'исплвк', 'ловкость': 'исплвк',
+                'вын': 'испвын', 'выносливость': 'испвын',
+                'инт': 'испинт', 'интеллект': 'испинт',
+                'мдр': 'испмдр', 'муд': 'испмдр', 'мудр': 'испмдр', 'мудрость': 'испмдр',
+                'хар': 'испхар', 'харизма': 'испхар',
+            }
+            _skill_key = _trial_map.get(_roll_words[1])
+            if not _skill_key:
+                _skill_key = None
+        else:
+            _skill_key = None
+
+        if _skill_key:
+            try:
+                characters = load_characters(user_id)
+                roll(characters[get_main_char_id(user_id) - 1], skill_name=_skill_key, has_message=True, user_id=user_id)
+            except IndexError:
+                if user_id not in user_warnings:
+                    send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
+                    user_warnings[user_id] = ''
+                roll(character='none', amount=1, die=20, has_message=True, user_id=user_id)
+            continue
         elif message_text in dnd5e_data.code_word_list:
-            if not 'пом' in message_text and not 'пре' in message_text:
+            if not ('пом' in message_text or 'пре' in message_text):
                 if message_text in ['ини', 'иниц', 'инициатива']:
                     roll_initiative_with_companions(user_id)
                     continue
                 try:
                     characters = load_characters(user_id)
-                    roll(characters[get_main_char_id(user_id) - 1], skill_name=message_text, has_message=True)
+                    roll(characters[get_main_char_id(user_id) - 1], skill_name=message_text, has_message=True, user_id=user_id)
                     continue
                 except IndexError:
                     if not user_id in user_warnings:
                         send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
                         user_warnings[user_id] = ''
-                    roll(character='none', amount=1, die=20, has_message=True) 
+                    roll(character='none', amount=1, die=20, has_message=True, user_id=user_id) 
                     continue   
 
-        elif 'пом' in message_text or 'пре' in message_text:
-            if message_text.strip() == 'помощь':
-                show_help(message_id)
-                continue
-            try:   
-                newtext = message_text.replace(" ", "")
-                if newtext[4:].isdigit():
-                    i = newtext.find('+')
-                    sign = 1
-                    if i == -1:
-                        sign = -1
-                    skill_tag = 'none'
-                    mod = int(newtext[4:])
-                else:
-                    mod = 0
-                    skill_tag = message_text[3:]
-                adv = message_text[0:3]
-                if skill_tag in dnd5e_data.code_word_list:
+        # Помеха/преимущество: поддерживаем как слитно (прелов), так и раздельно (пре лов / пре исп лвк)
+        # Важно: если формат не распознан — не делаем fallback в другой бросок.
+        _adv_words = msg_stripped.split()
+        _adv_prefix = None
+        _adv_handled = False
+        if _adv_words and _adv_words[0] in ('пом', 'пре'):
+            _adv_prefix = _adv_words[0]
+        else:
+            _joined = msg_stripped.replace(" ", "")
+            if _joined.startswith('пом') and _joined != 'помощь':
+                _adv_prefix = 'пом'
+            elif _joined.startswith('пре'):
+                _adv_prefix = 'пре'
+
+        if _adv_prefix in ('пом', 'пре'):
+            try:
+                adv = _adv_prefix
+
+                # 1) Раздельный формат: пре исп <...> / пом испытание <...>
+                # Поддерживаем:
+                # - Испытания: пре исп лвк / пом испытание мудрость
+                # - Проверки/навыки: пре исп лрк / пре исп ловрук / пре исп ловкость рук
+                if len(_adv_words) >= 3 and _adv_words[0] == adv and _adv_words[1] in ('исп', 'испытание'):
+                    _trial_map = {
+                        'сил': 'испсил', 'сила': 'испсил',
+                        'лвк': 'исплвк', 'лов': 'исплвк', 'ловкость': 'исплвк',
+                        'вын': 'испвын', 'выносливость': 'испвын',
+                        'инт': 'испинт', 'интеллект': 'испинт',
+                        'мдр': 'испмдр', 'муд': 'испмдр', 'мудр': 'испмдр', 'мудрость': 'испмдр',
+                        'хар': 'испхар', 'харизма': 'испхар',
+                    }
+                    # Сначала пробуем как испытание по одной характеристике (ровно 3 слова)
+                    if len(_adv_words) == 3 and _adv_words[2] in _trial_map:
+                        skill_tag = _trial_map[_adv_words[2]]
+                    else:
+                        # Иначе — пробуем как проверку/навык: одно слово или несколько (например "ловкость рук")
+                        skill_phrase = " ".join(_adv_words[2:]).strip()
+                        if skill_phrase in dnd5e_data.code_word_list:
+                            skill_tag = skill_phrase
+                        elif len(_adv_words) == 3 and _adv_words[2] in dnd5e_data.code_word_list:
+                            skill_tag = _adv_words[2]
+                        else:
+                            send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
+                            continue
+
                     try:
                         characters = load_characters(user_id)
-                        roll(characters[get_main_char_id(user_id) - 1], skill_name=skill_tag, has_message=True, adv=adv)
+                        roll(characters[get_main_char_id(user_id) - 1], skill_name=skill_tag, has_message=True, adv=adv, user_id=user_id)
                     except IndexError:
-                        if not user_id in user_warnings:
+                        if user_id not in user_warnings:
                             send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
                             user_warnings[user_id] = ''
-                        roll(character='none', amount=1, die=20, has_message=True, adv=adv)
-                        continue
-                elif len(message_text) == 3 or mod > 0 or mod < 0:
-                    roll(character='none', die=20, has_message=True, adv=adv, custom_mod = mod)
+                        roll(character='none', amount=1, die=20, has_message=True, adv=adv, user_id=user_id)
                     continue
-        
-            except ValueError:
-                send_message("Персонаж не подключен. Создайте персонажа, чтобы использовать эту функцию.")
+
+                # 2) Раздельный формат проверок навыка/характеристики: пре лов / пом про / пре акр / т.п.
+                if len(_adv_words) == 2 and _adv_words[0] == adv:
+                    skill_tag = _adv_words[1]
+                    if skill_tag in dnd5e_data.code_word_list:
+                        try:
+                            characters = load_characters(user_id)
+                            roll(characters[get_main_char_id(user_id) - 1], skill_name=skill_tag, has_message=True, adv=adv, user_id=user_id)
+                        except IndexError:
+                            if user_id not in user_warnings:
+                                send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
+                                user_warnings[user_id] = ''
+                            roll(character='none', amount=1, die=20, has_message=True, adv=adv, user_id=user_id)
+                        continue
+                    send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
+                    continue
+
+                # 3) Слитный формат (без пробелов): прелов / помпро / пре+5 / пом-2
+                _joined = msg_stripped.replace(" ", "")
+                if _joined.startswith(adv):
+                    rest = _joined[len(adv):]
+                    # модификатор без кода: пре+5 / пом-2
+                    if rest and (rest[0] in '+-' or rest.isdigit()):
+                        try:
+                            mod = int(rest)
+                        except ValueError:
+                            send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
+                            continue
+                        roll(character='none', die=20, has_message=True, adv=adv, custom_mod=mod, user_id=user_id)
+                        continue
+                    # пре<код>
+                    if rest in dnd5e_data.code_word_list:
+                        try:
+                            characters = load_characters(user_id)
+                            roll(characters[get_main_char_id(user_id) - 1], skill_name=rest, has_message=True, adv=adv, user_id=user_id)
+                        except IndexError:
+                            if user_id not in user_warnings:
+                                send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
+                                user_warnings[user_id] = ''
+                            roll(character='none', amount=1, die=20, has_message=True, adv=adv, user_id=user_id)
+                        continue
+
+                send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
                 continue
-            except KeyError:
-                send_message("Персонаж не подключен. Создайте персонажа, чтобы использовать эту функцию.")
+
+            except (ValueError, KeyError):
+                send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
                 continue
-            except IndexError:
-                send_message("Персонаж не подключен. Создайте персонажа, чтобы использовать эту функцию.")
-                continue
-            continue
         try:
+            # Ячейки заклинаний: -яч 1 / -яч1 (потратить), +яч 1 2 (восстановить). Для колдуна: +яч / -яч / +яч 2 (без круга).
+            _msg = message_text.strip().lower()
+            if _msg.startswith('-яч') or _msg.startswith('+яч'):
+                sign = -1 if _msg[0] == '-' else 1
+                rest = _msg[1:].strip()  # "яч 1 2" или "яч1 2" или "яч" или "яч 2"
+                if not rest.startswith('яч'):
+                    send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
+                    continue
+                rest = rest[2:].strip()  # "1 2" / "1" / "" / "2"
+                try:
+                    char = load_main_character(user_id)
+                except (IndexError, TypeError):
+                    send_message("Персонаж не подключен.", keyboard=keyboards.main_keyboard)
+                    continue
+                is_warlock = (char.get('class') or '').lower() == 'колдун'
+                parts = rest.split() if rest else []
+
+                if is_warlock and (len(parts) == 0 or len(parts) == 1):
+                    # Колдун: +яч / -яч (1 ячейка) или +яч 2 / -яч 2 (количество)
+                    amount = int(parts[0]) if len(parts) == 1 else 1
+                    if amount < 1:
+                        send_message("Количество — не менее 1.", keyboard=keyboards.main_keyboard)
+                        continue
+                    level = max(1, min(20, int(char.get('level', 1))))
+                    # Таблица колдуна: уровень -> (круг ячеек, макс. ячеек). PHB 5e.
+                    if level == 1:
+                        circle, max_for_circle = 1, 1
+                    elif level == 2:
+                        circle, max_for_circle = 1, 2
+                    elif level <= 4:
+                        circle, max_for_circle = 2, 2
+                    elif level <= 6:
+                        circle, max_for_circle = 3, 2
+                    elif level <= 8:
+                        circle, max_for_circle = 4, 2
+                    elif level <= 10:
+                        circle, max_for_circle = 5, 2
+                    elif level <= 16:
+                        circle, max_for_circle = 5, 3
+                    else:
+                        circle, max_for_circle = 5, 4
+                    try:
+                        curr = char['current_spell_slots']
+                        max_slots = char['spell_slots']
+                    except KeyError:
+                        char['spell_slots'] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                        char['current_spell_slots'] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                        curr = char['current_spell_slots']
+                        max_slots = char['spell_slots']
+                    while len(max_slots) <= circle:
+                        max_slots.append(0)
+                    max_slots[circle] = max_for_circle
+                    cur_val = curr[circle] if circle < len(curr) else 0
+                    new_val = cur_val + sign * amount
+                    new_val = max(0, min(max_for_circle, new_val))
+                    if circle >= len(curr):
+                        while len(curr) <= circle:
+                            curr.append(0)
+                    curr[circle] = new_val
+                    char['current_spell_slots'] = curr
+                    char['spell_slots'] = max_slots
+                    change_param(char, 'current_spell_slots', curr)
+                    change_param(char, 'spell_slots', max_slots)
+                    send_message(f"Ячейки колдуна ({circle}-й круг): теперь {new_val} из {max_for_circle}.")
+                    continue
+
+                if not rest:
+                    send_message("Укажите круг (1–9), например: -яч 1 или +яч 1 2. Колдун: -яч / +яч без числа.", keyboard=keyboards.main_keyboard)
+                    continue
+                try:
+                    circle = int(parts[0])
+                    amount = int(parts[1]) if len(parts) > 1 else 1
+                except (ValueError, IndexError):
+                    send_message("Команда не распознана. Формат: -яч 1 (потратить), +яч 1 2 (восстановить 2 ячейки 1 круга).", keyboard=keyboards.main_keyboard)
+                    continue
+                if circle < 1 or circle > 9 or amount < 1:
+                    send_message("Круг — от 1 до 9, количество — не менее 1.", keyboard=keyboards.main_keyboard)
+                    continue
+                try:
+                    curr = char['current_spell_slots']
+                    max_slots = char['spell_slots']
+                except KeyError:
+                    char['spell_slots'] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                    char['current_spell_slots'] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                    curr = char['current_spell_slots']
+                    max_slots = char['spell_slots']
+                max_for_circle = max_slots[circle] if circle < len(max_slots) else 0
+                if max_for_circle == 0:
+                    send_message(f"У персонажа нет ячеек {circle}-го круга.", keyboard=keyboards.main_keyboard)
+                    continue
+                cur_val = curr[circle] if circle < len(curr) else 0
+                new_val = cur_val + sign * amount
+                new_val = max(0, min(max_for_circle, new_val))
+                curr[circle] = new_val
+                char['current_spell_slots'] = curr
+                change_param(char, 'current_spell_slots', curr)
+                send_message(f"Ячейки {circle}-го круга: теперь {new_val} из {max_for_circle}.")
+                continue
+
+            # Команда «сн очистить …» / «сн очисть …» / «сн очист …» — удалить ВСЕ предметы с указанным названием (по имени)
+            _msg_lower = message_text.strip().lower()
+            equipment_cmd_handled = False
+            clear_prefixes = (
+                'снаряжение очистить ', 'снаряжение очисть ', 'снаряжение очист ',
+                'экипировка очистить ', 'экипировка очисть ', 'экипировка очист ',
+                'снар очистить ', 'снар очисть ', 'снар очист ',
+                'экип очистить ', 'экип очисть ', 'экип очист ',
+                'сн очистить ', 'сн очисть ', 'сн очист ',
+            )
+            for prefix in clear_prefixes:
+                if _msg_lower.startswith(prefix):
+                    rest = message_text.strip()[len(prefix):].strip()
+                    if rest:
+                        try:
+                            char = load_main_character(user_id)
+                            characters = load_characters(user_id)
+                            names = [s.strip() for s in rest.split(',') if s.strip()]
+                            if not names:
+                                send_message("Укажите название предмета, например: сн очистить зелье лечение", keyboard=keyboards.main_keyboard)
+                            else:
+                                deleted, not_found = delete_equipment_by_name_all(char, names)
+                                replace_char(char, characters)
+                                write_characters(user_id, characters)
+                                msg = f"Удалено предметов: {deleted}."
+                                if not_found:
+                                    msg += "\n" + "\n".join(not_found)
+                                send_message(msg, keyboard=keyboards.main_keyboard)
+                                show_equipment(char, show_keyboard=False)
+                        except Exception:
+                            send_message("Ошибка при очистке. Формат: сн очистить название (удалит все с таким названием).", keyboard=keyboards.main_keyboard)
+                    else:
+                        send_message("Укажите название предмета, например: сн очистить зелье лечение", keyboard=keyboards.main_keyboard)
+                    equipment_cmd_handled = True
+                    break
+            if not equipment_cmd_handled:
+                delete_prefixes = ('снаряжение удалить ', 'снаряжение удал ', 'экипировка удалить ', 'экипировка удал ', 'снар удалить ', 'снар удал ', 'экип удалить ', 'экип удал ', 'сн удалить ', 'сн удал ')
+                for prefix in delete_prefixes:
+                    if _msg_lower.startswith(prefix):
+                        rest = message_text.strip()[len(prefix):].strip()
+                        if rest:
+                            try:
+                                char = load_main_character(user_id)
+                                characters = load_characters(user_id)
+                                parsed_items = parse_equipment_bulk(rest)
+                                if not parsed_items:
+                                    send_message("Не найдено ни одного предмета. Укажите что удалить: сн удал 5 Кинжал, рубин (50 зм)", keyboard=keyboards.main_keyboard)
+                                else:
+                                    deleted, errors = delete_equipment_bulk(char, parsed_items)
+                                    replace_char(char, characters)
+                                    write_characters(user_id, characters)
+                                    msg = f"Удалено предметов: {deleted}."
+                                    if errors:
+                                        msg += "\n" + "\n".join(errors)
+                                    send_message(msg, keyboard=keyboards.main_keyboard)
+                                    show_equipment(char, show_keyboard=False)
+                            except Exception:
+                                send_message("Ошибка при удалении. Формат: сн удал название [кол-во] [вес] [стоимость]. Совпадение по названию и стоимости.", keyboard=keyboards.main_keyboard)
+                        else:
+                            send_message("Укажите предметы для удаления, например: сн удал 5 Кинжал, рубин (50 зм)", keyboard=keyboards.main_keyboard)
+                        equipment_cmd_handled = True
+                        break
+            if not equipment_cmd_handled:
+                for prefix in ('снаряжение ', 'экипировка ', 'снар ', 'экип ', 'сн '):
+                    if _msg_lower.startswith(prefix):
+                        rest = message_text.strip()[len(prefix):].strip()
+                        if rest:
+                            try:
+                                char = load_main_character(user_id)
+                                characters = load_characters(user_id)
+                                parsed_items = parse_equipment_bulk(rest)
+                                if not parsed_items:
+                                    send_message("Не найдено ни одного предмета. Формат: 5 Кинжал, рубин (50 зм), ложка 1 фунт", keyboard=keyboards.main_keyboard)
+                                else:
+                                    for it in parsed_items:
+                                        create_item(char, name=it['name'], amount=it['amount'], cost=it['cost'] if it.get('cost') else None, weight_str=it.get('weight_str', ''))
+                                    replace_char(char, characters)
+                                    write_characters(user_id, characters)
+                                    send_message('Предметы добавлены.')
+                                    show_equipment(char, show_keyboard=False)
+                            except Exception:
+                                send_message("Ошибка при добавлении. Проверьте формат: название [кол-во] [вес] [стоимость].", keyboard=keyboards.main_keyboard)
+                        else:
+                            char = load_main_character(user_id)
+                            show_equipment(char, show_keyboard=False)
+                        equipment_cmd_handled = True
+                        break
+            if equipment_cmd_handled:
+                continue
             if message_text in dnd5e_data.code_fast_no_value:
-                if message_text in ['снар','снаряжение', 'сн']:
+                if message_text in ['снар', 'снаряжение', 'сн', 'экип', 'экипировка']:
                     char = load_main_character(user_id)
                     show_equipment(char, show_keyboard=False)
                 if message_text in ['ячвосст','восстяч', 'восстановить ячейки']:
@@ -3282,7 +4086,7 @@ for event in longpoll.listen():
                     show_features(char)
                 if message_text in ['сл','заклсл', 'сложность испытаний']:
                     char = load_main_character(user_id)
-                    send_message(f"Ваша СЛ испытаний для заклинаний: {8 + get_mod(get_spell_stat(char),char) + char['proficiency_bonus']}") 
+                    send_message(f"Ваша СЛ испытаний для заклинаний: {8 + get_mod(get_spell_stat(char),char) + char['proficiency_bonus']}")
                 if message_text in ['закл','заклин','зак', 'заклинания']:
                     char = load_main_character(user_id)
                     show_all_spells(char, show_keyboard=False, ttg_msg = False)
@@ -3313,12 +4117,9 @@ for event in longpoll.listen():
                     if lvl == 20:
                         send_message("Вы уже максимального уровня.")
                     elif lvl > 1 or lvl < 20:
-
                         change_param(char,'level',lvl+1)
-                        
                         hit_dice_new_curr = char['hit_dice_count'] + 1
                         newbonus = dnd5e_data.proficiency_bonus(lvl+1)
-                        
                         change_param(char,'proficiency_bonus',newbonus)
                         change_param(char,'hit_dice_max',lvl+1)
                         change_param(char,'hit_dice_count',hit_dice_new_curr)
@@ -3326,7 +4127,47 @@ for event in longpoll.listen():
                         user_states[user_id] = {'character': char, 'state': 'hpincrease', 'step': 1}
                 continue
             elif message_text == 'я':
-                send_message(char_sheet_message(load_main_character(user_id)))
+                try:
+                    char = load_main_character(user_id)
+                    send_message(char_sheet_message(char))
+                except Exception:
+                    send_message("Не удалось загрузить персонажа. Проверьте, что выбран основной персонаж.")
+                continue
+            elif message_text == 'лист':
+                sheet_path = None
+                portrait_path = None
+                try:
+                    char = load_main_character(user_id)
+                    if char.get('image'):
+                        portrait_path = download_character_photo(char['image'], image_url=char.get('image_url'))
+                    sheet_path = character_sheet_image.generate_character_sheet_image(char, portrait_path=portrait_path)
+                    peer_id = (2000000000 + message_id) if chat_id is not None else message_id
+                    photo_list = vk_upload.photo_messages(sheet_path, peer_id=peer_id)
+                    if photo_list and len(photo_list) > 0:
+                        att = f"photo{photo_list[0]['owner_id']}_{photo_list[0]['id']}"
+                        send_message("Лист персонажа:", attachment=att)
+                    else:
+                        send_message(char_sheet_message(char))
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    try:
+                        char = load_main_character(user_id)
+                        send_message(char_sheet_message(char))
+                    except Exception:
+                        send_message("Не удалось загрузить персонажа или сформировать лист. Проверьте, что выбран основной персонаж.")
+                    print(f"Генерация листа персонажа (картинка): {e}")
+                finally:
+                    if sheet_path and os.path.exists(sheet_path):
+                        try:
+                            os.remove(sheet_path)
+                        except OSError:
+                            pass
+                    if portrait_path and os.path.exists(portrait_path) and portrait_path != sheet_path:
+                        try:
+                            os.remove(portrait_path)
+                        except OSError:
+                            pass
                 continue
             elif message_text == 'навыки':
                 show_all_skills(load_main_character(user_id),horizontal_format=True, show_all=True)
@@ -3427,7 +4268,7 @@ for event in longpoll.listen():
                             continue
                         newhp = 0
                         for i in range(value):
-                            newhp += roll(char, 1, hitdie, 'вын', has_message=True)
+                            newhp += roll(char, 1, hitdie, 'вын', has_message=True, user_id=user_id)
 
                         # elif message_text == 'вручную':
                         #     try:
@@ -3454,24 +4295,7 @@ for event in longpoll.listen():
                         change_param(char,'hit_points', newhp)
                         send_message(f"У вас теперь {newhp} из {char['max_hit_points']} ПЗ.")
                     if code in ['яч']:
-                        char = load_main_character(user_id)
-                        if value < 0:
-                            sign = -1
-                            value = abs(value)
-                        else: sign = 1
-                        if value < 0 or value > 9:
-                            send_message("Неверный формат бонуса.")
-                            continue
-                        numberspellslots = char['current_spell_slots'][value]
-                        newslot = numberspellslots + sign
-                        if newslot < 0:
-                            newslot = 0
-                            #send_message('Вы падаете без сознания!')
-                        if newslot > char['spell_slots'][value]:
-                            newslot = char['spell_slots'][value]
-                        char['current_spell_slots'][value] = newslot
-                        change_param(char,'current_spell_slots', char['current_spell_slots'])
-                        send_message(f"У вас теперь {newslot} из {char['spell_slots'][value]} ячеек ({value}-го круга).")
+                        send_message("Используйте формат: -яч 1 (потратить 1 ячейку 1 круга), +яч 1 2 (восстановить 2 ячейки 1 круга). Только «яч» — показать ячейки.", keyboard=keyboards.main_keyboard)
                     if code in ['кз']:
                         char = load_main_character(user_id)
                         newhd= char['hit_dice_count'] + value
@@ -3589,6 +4413,11 @@ for event in longpoll.listen():
 
             elif message_text == "мои персонажи":
                 manage_character_flow(user_id, 1, "")
+
+            elif message_text.lower() == "редакция":
+                user_states[user_id] = {'state': 'choose_edition'}
+                current = get_user_edition(user_id)
+                send_message(f"Текущая редакция: {current}. Выберите редакцию правил (2014 или 2024). В 2024 доступны виды из PHB 2024, расовые бонусы к характеристикам не применяются.", keyboards.edition_keyboard)
 
             elif message_text == "помощь":
                 show_help(message_id)

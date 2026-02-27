@@ -21,6 +21,14 @@ main_keyboard = {
         [{
             "action": {
                 "type": "text",
+                "payload": "{\"button\": \"edition\"}",
+                "label": "Редакция"
+            },
+            "color": "secondary"
+        }],
+        [{
+            "action": {
+                "type": "text",
                 "payload": "{\"button\": \"3\"}",
                 "label": "Закрыть клавиатуру"
             },
@@ -32,6 +40,24 @@ main_keyboard = {
                 "payload": "{\"button\": \"3\"}",
                 "label": "Помощь"
             },
+            "color": "secondary"
+        }]
+    ]
+}
+
+edition_keyboard = {
+    "one_time": False,
+    "buttons": [
+        [{
+            "action": {"type": "text", "payload": "{\"button\": \"2014\"}", "label": "2014"},
+            "color": "primary"
+        },
+        {
+            "action": {"type": "text", "payload": "{\"button\": \"2024\"}", "label": "2024"},
+            "color": "primary"
+        }],
+        [{
+            "action": {"type": "text", "payload": "{\"button\": \"back\"}", "label": "Назад"},
             "color": "secondary"
         }]
     ]
@@ -191,7 +217,7 @@ char_edit_keyboard_not_main = {
             "action": {
                 "type": "text",
                 "payload": "{\"button\": \"1\"}",
-                "label": "Снаряжение"
+                "label": "Экипировка"
             },
             "color": "primary"
         },
@@ -261,7 +287,7 @@ char_edit_keyboard_main = {
             "action": {
                 "type": "text",
                 "payload": "{\"button\": \"1\"}",
-                "label": "Снаряжение"
+                "label": "Экипировка"
             },
             "color": "primary"
         },
