@@ -9,7 +9,6 @@ import os
 import tempfile
 import threading
 import time
-from urllib.parse import quote
 import requests
 import dnd5e_data
 
@@ -1133,33 +1132,89 @@ def show_equipment(character, show_keyboard=True):
     else:
         send_message(message)
 
-def get_ttg_link(spellname):
-    link = ''
-    start = spellname.find('[') + 1  # +1, чтобы не включать '['
-    end = spellname.find(']')
-    if start != -1 and end != -1:  # Проверяем, что оба символа найдены
-        result = spellname[start:end]
-        spellwords = result.split(" ")
-        for i in range(len(spellwords)):
-            link +=spellwords[i]+"_"
-        link = link[:-1]
-        link = "https://5e14.ttg.club/spells/" + link
-        return link
-    else:
-        print("Символы не найдены")
+DND5E_CLUB_SPELLS_URL = "https://dnd5e.club/spells"
 
 
-def get_dndsort_spell_link(spellname):
-    """Если в названии заклинания есть [англ. название], возвращает ссылку dndsort.ru/#spell24-engname (пробелы → дефисы). Иначе None."""
+def _eng_name_to_spell_slug(eng):
+    """Преобразует английское название заклинания в slug dnd5e.club (например, Tasha's → tasha-s)."""
+    slug = eng.lower().strip()
+    slug = re.sub(r"'s\b", "-s", slug)
+    slug = slug.replace("'", "")
+    slug = re.sub(r'[^a-z0-9]+', '-', slug)
+    return slug.strip('-')
+
+
+def _extract_bracketed_eng_name(spellname):
     start = spellname.find('[')
     end = spellname.find(']')
     if start == -1 or end == -1 or end <= start:
         return None
     eng = spellname[start + 1:end].strip()
+    return eng or None
+
+
+def get_dnd5e_spell_link(spellname):
+    """Если в названии заклинания есть [англ. название], возвращает ссылку dnd5e.club/spells/slug. Иначе None."""
+    eng = _extract_bracketed_eng_name(spellname)
     if not eng:
         return None
-    engname = eng.replace(' ', '-').lower()
-    return "https://dndsort.ru/#spell24-" + engname
+    return f"{DND5E_CLUB_SPELLS_URL}/{_eng_name_to_spell_slug(eng)}"
+
+
+def _is_eng_spell_query(query):
+    """Запрос похож на английское название заклинания (латиница, пробелы, апостроф)."""
+    q = query.strip()
+    if not q:
+        return False
+    return bool(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9\s'\-]*", q))
+
+
+def find_dnd5e_spell_link(query):
+    """Ищет заклинание на dnd5e.club по запросу (рус/англ) через GraphQL API."""
+    query = query.strip()
+    if not query:
+        return None
+    try:
+        resp = requests.post(
+            'https://dnd5e.club/graphql',
+            json={
+                'query': 'query($text: String!) { findSpells(text: $text) { id title } }',
+                'variables': {'text': query},
+            },
+            timeout=5,
+        )
+        resp.raise_for_status()
+        spells = resp.json().get('data', {}).get('findSpells') or []
+        if spells:
+            return f"{DND5E_CLUB_SPELLS_URL}/{spells[0]['id']}"
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        pass
+    # GraphQL findSpells ищет по русским названиям — для английских строим slug напрямую
+    eng_query = _extract_bracketed_eng_name(query) or query
+    if _is_eng_spell_query(eng_query):
+        slug = _eng_name_to_spell_slug(eng_query)
+        if slug:
+            return f"{DND5E_CLUB_SPELLS_URL}/{slug}"
+    return None
+
+
+def resolve_spell_link(spellname):
+    """Возвращает ссылку на заклинание на dnd5e.club (по [англ.] или поиску по русскому названию)."""
+    link = get_dnd5e_spell_link(spellname)
+    if link:
+        return link
+    if ' [' in spellname:
+        search_name = spellname.split(' [')[0].strip()
+    else:
+        search_name = spellname.strip()
+    if search_name and len(search_name) > 1 and search_name[0].isdigit() and search_name[1:2].isspace():
+        search_name = search_name[2:].strip()
+    return find_dnd5e_spell_link(search_name) or DND5E_CLUB_SPELLS_URL
+
+
+def get_dndsort_spell_link(spellname):
+    """Обратная совместимость: ссылка на заклинание на dnd5e.club."""
+    return get_dnd5e_spell_link(spellname)
 
     
     
@@ -1275,7 +1330,7 @@ def show_all_spells(character, show_keyboard=True, ttg_msg=True):
             message += f"{item_count}. {spell_list[i]['name']}\n"
             spell_list[i]['id'] = item_count
     if ttg_msg:
-        message += "\nВведите номер заклинания, чтобы получить ссылку на ttg.club:" # ["Список (не доступно)", "primary"],
+        message += "\nВведите номер заклинания, чтобы получить ссылку на dnd5e.club:" # ["Список (не доступно)", "primary"],
     if show_keyboard == True:
         change_param(character, 'known_spells', spell_list)
         send_message(message, keyboard_maker([["Добавить новые", "primary"],["Удаление заклинаний", "secondary"]], keyboard_columns=1, hasbackbutton=True))
@@ -2488,17 +2543,13 @@ def manage_character_flow(user_id, step, message_text, attachments=None, origina
         elif num in range(1, len(spells) + 1):
             for i in range(len(spells)):
                 if num == state['character']['known_spells'][i]['id']:
-                    try:
-                        msg =  get_ttg_link(state['character']['known_spells'][i]['name']).lower()
-                        send_message(msg)
-                    except AttributeError:
-                        send_message("Неверный формат для вывода ссылки.")
+                    send_message(resolve_spell_link(state['character']['known_spells'][i]['name']))
                     break
             
 
         elif message_text == 'добавить новые': 
             state['step'] = 'newspells'
-            send_message('Укажите названия новых заклинаний в формате:\n\n"X имя заклинания [english name]", \n\nгде X - круг заклинания (0 для фокуса), \nenglish name - название на английском в квадратных скобках (необязательно, но без него не будет работать ссылка на ttg.club). \n\nМожно ввести несколько, каждый на новой строке, например:\n\n0 Леденящее прикосновение [Chill Touch]\n2 Невидимость [Invisibility]', keyboards.back_keyboard)
+            send_message('Укажите названия новых заклинаний в формате:\n\n"X имя заклинания [english name]", \n\nгде X - круг заклинания (0 для фокуса), \nenglish name - название на английском в квадратных скобках (необязательно, но без него не будет работать ссылка на dnd5e.club). \n\nМожно ввести несколько, каждый на новой строке, например:\n\n0 Леденящее прикосновение [Chill Touch]\n2 Невидимость [Invisibility]', keyboards.back_keyboard)
         elif message_text == 'удаление заклинаний':
             if len(state['character']['known_spells']) > 0:
                 # show_all_spells(state['character'], ttg_msg=False)
@@ -3409,9 +3460,9 @@ HELP_TOPICS = {
         "• Испытания: [кличка] исп лов | исп сил | исп вын | исп инт | исп муд | исп хар (например: рим исп лов)\n"
         "• Навыки: [кличка] <код> [число], например: рим лов 5, рим сил -1, рим лов (бросок)"
     )),
-    'справка': ('Справка dndsort.ru (справ, dnd, спр)', (
-        "Поиск по справочнику: справка <запрос> или справ / dnd / спр.\n"
-        "Пример: справка огненный шар → ссылка на dndsort.ru\n"
+    'справка': ('Справка dnd5e.club (справ, dnd, спр)', (
+        "Поиск заклинаний: справка <запрос> или справ / dnd / спр.\n"
+        "Пример: справка огненный шар или спр fireball → ссылка на dnd5e.club\n"
         "По номеру заклинания: спр закл N — ссылка на N-е заклинание из вашего списка (например: спр закл 1)."
     )),
     'кубики': ('Броски кубиков XdY и по характеристикам', (
@@ -3524,8 +3575,8 @@ def handle_bot_event(incoming_event):
         
         print(f'{message_text}') #текст в терминал
 
-        # Команда справки: ссылка на dndsort.ru (справка/справ/dnd/спр + текст запроса)
-        # Специальный формат: спр закл N — ссылка на N-е заклинание из списка персонажа (dndsort.ru)
+        # Команда справки: ссылка на dnd5e.club (справка/справ/dnd/спр + текст запроса)
+        # Специальный формат: спр закл N — ссылка на N-е заклинание из списка персонажа (dnd5e.club)
         dnd_ref_commands = ('справка ', 'справ ', 'dnd ', 'спр ')
         msg_stripped = message_text.strip()
         dnd_ref_handled = False
@@ -3544,18 +3595,7 @@ def handle_bot_event(incoming_event):
                             if num > 0 and num <= len(spells):
                                 for s in spells:
                                     if s.get('id') == num:
-                                        name = s.get('name', '')
-                                        # Если есть [англ. название] — ссылка dndsort.ru/#spell24-engname (дефисы вместо пробелов)
-                                        link = get_dndsort_spell_link(name)
-                                        if link is None:
-                                            if ' [' in name:
-                                                search_name = name.split(' [')[0].strip()
-                                            else:
-                                                search_name = name
-                                            if search_name and len(search_name) > 1 and search_name[0].isdigit() and search_name[1:2].isspace():
-                                                search_name = search_name[2:].strip()
-                                            link = "https://dndsort.ru/#" + quote(search_name or name, safe='')
-                                        send_message(link)
+                                        send_message(resolve_spell_link(s.get('name', '')))
                                         dnd_ref_handled = True
                                         break
                                 else:
@@ -3568,15 +3608,15 @@ def handle_bot_event(incoming_event):
                         dnd_ref_handled = True
                         break
                 if not dnd_ref_handled and query:
-                    link = "https://dndsort.ru/#" + quote(query, safe='')
+                    link = find_dnd5e_spell_link(query) or DND5E_CLUB_SPELLS_URL
                     send_message(link)
                     dnd_ref_handled = True
                 elif not dnd_ref_handled:
-                    send_message("Укажите поисковый запрос после команды, например: справка огненный шар\nИли: спр закл 1 — ссылка на первое заклинание из вашего списка.")
+                    send_message("Укажите поисковый запрос после команды, например: справка огненный шар или спр fireball\nИли: спр закл 1 — ссылка на первое заклинание из вашего списка.")
                     dnd_ref_handled = True
                 break
         if not dnd_ref_handled and msg_stripped in ('справка', 'справ', 'dnd', 'спр'):
-            send_message("Использование: справка <запрос>\nНапример: справка огненный шар\nИли: спр закл 1 — ссылка на заклинание по номеру в списке.")
+            send_message("Использование: справка <запрос>\nНапример: справка огненный шар или спр fireball\nИли: спр закл 1 — ссылка на заклинание по номеру в списке.")
             dnd_ref_handled = True
         if dnd_ref_handled:
             return
@@ -4504,38 +4544,6 @@ def handle_bot_event(incoming_event):
                     if message_text in ['вр','вз']:
                         charthp = load_main_character(user_id)['temp_hit_points']
                         send_message(f"У вас {charthp} временных ПЗ.")
-                return
-            elif message_text[0:3] in dnd5e_data.code_fast_value: #трехбуквенные коды, ттг
-                if len(message_text)>3:
-                    parts = message_text.split(' ')
-                    if len(parts) > 2:
-                        send_message("Неверный формат бонуса.")
-                        return
-                    if len(parts) <1:
-                        send_message("Неверный формат бонуса.")
-                        return
-                    try:
-                        code = parts[0]
-                        value = parts[1]
-                        value = int(value)
-                    except ValueError:
-                        send_message("Пожалуйста, введите правильный номер заклинания для получения ссылки.")
-                        return
-                    if code in ['ttg','ттг']:
-                        char = load_main_character(user_id)
-                        spells = char['known_spells']
-                        if value > 0 and value <= len(spells):
-                            for i in range(len(spells)):
-                                if value == char['known_spells'][i]['id']:
-                                    try:
-                                        msg =  get_ttg_link(char['known_spells'][i]['name']).lower()
-                                        send_message(msg)
-                                    except AttributeError:
-                                        send_message("Неверный формат для вывода ссылки.")
-                                    break
-                        else:
-                            send_message("Заклинания под таким номером не существует.")
-                        return
                 return
         except ValueError:
             send_message("Персонаж не подключен. Создайте персонажа, чтобы использовать эту функцию.")
