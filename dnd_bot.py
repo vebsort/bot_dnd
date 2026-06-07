@@ -49,6 +49,7 @@ vk_upload = None
 current_platform = 'vk'
 telegram_chat_id = None
 telegram_message_id = None
+telegram_last_reply_markup_by_chat = {}
 transport_lock = threading.RLock()
 
 # Состояния пользователей (для простой машины состояний)
@@ -149,10 +150,10 @@ def download_character_photo(photo_attachment, image_url=None, vk_api_obj=None):
 
 
 #функция отправки сообщения (в зависимости от лички/беседы меняет параметры)
-def send_message(message, keyboard=None, attachment=None):
+def send_message(message, keyboard=None, attachment=None, remove_keyboard=False):
     """Отправляет сообщение пользователю. attachment — строка вложения VK (например, photo123_456)."""
     if current_platform == 'telegram':
-        send_telegram_message(message, keyboard=keyboard, attachment=attachment)
+        send_telegram_message(message, keyboard=keyboard, attachment=attachment, remove_keyboard=remove_keyboard)
         return
 
     if event.chat_id != None:
@@ -204,12 +205,23 @@ def vk_keyboard_to_telegram_markup(keyboard):
     return {
         'keyboard': rows,
         'resize_keyboard': True,
-        'one_time_keyboard': bool(keyboard.get('one_time')),
+        'one_time_keyboard': False,
+        'is_persistent': True,
     }
 
 
-def send_telegram_message(message, keyboard=None, attachment=None):
-    reply_markup = vk_keyboard_to_telegram_markup(keyboard)
+def send_telegram_message(message, keyboard=None, attachment=None, remove_keyboard=False):
+    global telegram_last_reply_markup_by_chat
+    if remove_keyboard:
+        reply_markup = {'remove_keyboard': True}
+        telegram_last_reply_markup_by_chat.pop(telegram_chat_id, None)
+    elif keyboard is not None:
+        reply_markup = vk_keyboard_to_telegram_markup(keyboard)
+        if reply_markup and telegram_chat_id is not None:
+            telegram_last_reply_markup_by_chat[telegram_chat_id] = reply_markup
+    else:
+        reply_markup = telegram_last_reply_markup_by_chat.get(telegram_chat_id)
+
     params = {
         'chat_id': telegram_chat_id,
         'text': message,
@@ -1717,9 +1729,11 @@ class_keyboard = keyboard_maker(array_to_text_color_array(list(dnd5e_data.classe
 
 #Режимы программы: 1. Создание персонажа, 2. Управление персонажами
 
-def create_character_flow(user_id, step, message_text, attachments=None): #создание персонажа
+def create_character_flow(user_id, step, message_text, attachments=None, original_message_text=None): #создание персонажа
     """Обрабатывает процесс создания персонажа. attachments — список вложений сообщения (для шага загрузки картинки)."""
     attachments = attachments or []
+    if original_message_text is None:
+        original_message_text = message_text
     characters = load_characters(user_id)
     
     if len(characters) >=30:
@@ -2220,8 +2234,10 @@ def create_character_flow(user_id, step, message_text, attachments=None): #со�
             send_message(next_message, keyboard_maker(array_to_text_color_array(["Пропустить"]), hasbackbutton=True))
 
 
-def manage_character_flow(user_id, step, message_text, attachments=None): #управление персонажами
+def manage_character_flow(user_id, step, message_text, attachments=None, original_message_text=None): #управление персонажами
     attachments = attachments or []
+    if original_message_text is None:
+        original_message_text = message_text
     if user_id not in user_states:
         user_states[user_id] = {'state': 'manage_character', 'step': 1, 'namestate': False, 'all_characters': [], 'character': {}, 'editparam': ''}
     state = user_states[user_id]
@@ -3787,9 +3803,9 @@ def handle_bot_event(incoming_event):
                 return
             print(user_states[user_id]['step'])
             if user_states[user_id]['state'] == 'create_character':
-                create_character_flow(user_id, user_states[user_id]['step'], message_text, attachments)
+                create_character_flow(user_id, user_states[user_id]['step'], message_text, attachments, original_message_text)
             elif user_states[user_id]['state'] == 'manage_character':
-                manage_character_flow(user_id, user_states[user_id]['step'], message_text, attachments)
+                manage_character_flow(user_id, user_states[user_id]['step'], message_text, attachments, original_message_text)
 
             return
 
@@ -4532,7 +4548,7 @@ def handle_bot_event(incoming_event):
             return
 
         if message_text in ['закрыть клавиатуру','закрклав','-клав','-кл','зкл']:
-            send_message("Клавиатура закрыта.")
+            send_message("Клавиатура закрыта.", remove_keyboard=(current_platform == 'telegram'))
             return
 
         elif chat_id == None:
@@ -4586,6 +4602,11 @@ def run_telegram_bot():
     global current_platform, telegram_chat_id, telegram_message_id
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError('TELEGRAM_BOT_TOKEN is not set')
+    try:
+        telegram_api('deleteWebhook', drop_pending_updates=True)
+        print('Telegram webhook cleared, long polling enabled')
+    except Exception as exc:
+        print('Telegram deleteWebhook warning:', exc)
     offset = None
     print('Telegram bot started')
     while True:
@@ -4610,6 +4631,17 @@ def run_telegram_bot():
                     telegram_chat_id = chat.get('id')
                     telegram_message_id = message.get('message_id')
                     handle_bot_event(_TelegramEvent(update))
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 409:
+                print(
+                    'Telegram polling error: 409 Conflict — '
+                    'уже работает другой экземпляр бота с этим токеном. '
+                    'Остановите все другие копии (терминалы, сервер, VK+TG одновременно в двух процессах).'
+                )
+            else:
+                print('Telegram polling error:', exc)
+            time.sleep(5)
         except Exception as exc:
             print('Telegram polling error:', exc)
             time.sleep(5)
