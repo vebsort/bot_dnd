@@ -53,7 +53,7 @@ transport_lock = threading.RLock()
 
 # Состояния пользователей (для простой машины состояний)
 user_states = {}
-# Ожидание выбора результата поиска по dnd5e.club (отдельно от user_states)
+# Ожидание текстового ввода 1–5 после поиска (кнопки url работают без состояния)
 dnd5e_search_states = {}
 user_warnings = {}
 # Последний бросок по user_id для переброса вдохновением (-вдох)
@@ -1361,78 +1361,26 @@ def dnd5e_handbook_item_url(item):
     return f"{DND5E_CLUB_BASE_URL}/{item['url_path']}/{item['id']}"
 
 
-def make_dnd5e_search_inline_keyboard(result_count):
-    """Inline-клавиатура 1–N и «Назад» — привязана к сообщению с результатами поиска."""
-    number_row = []
-    for i in range(1, result_count + 1):
-        number_row.append({
-            'action': {
-                'type': 'callback',
-                'label': str(i),
-                'payload': json.dumps({'d5search': i}, ensure_ascii=False),
-            },
-            'color': 'primary',
-        })
+def make_dnd5e_search_inline_keyboard(results):
+    """Inline-клавиатура: кнопки 1–N сразу открывают ссылку на dnd5e.club."""
     return {
         'inline': True,
-        'buttons': [
-            number_row,
-            [{
-                'action': {
-                    'type': 'callback',
-                    'label': 'Назад',
-                    'payload': json.dumps({'d5search': 0}, ensure_ascii=False),
-                },
-                'color': 'secondary',
-            }],
-        ],
+        'buttons': [[{
+            'action': {
+                'type': 'open_link',
+                'link': r['url'],
+                'label': str(i),
+            },
+        } for i, r in enumerate(results, 1)]],
     }
 
 
-def dnd5e_search_inline_keyboard_for_telegram(result_count):
+def dnd5e_search_inline_keyboard_for_telegram(results):
     return {
         'inline_keyboard': [
-            [{'text': str(i), 'callback_data': f'd5s:{i}'} for i in range(1, result_count + 1)],
-            [{'text': 'Назад', 'callback_data': 'd5s:0'}],
+            [{'text': str(i), 'url': r['url']} for i, r in enumerate(results, 1)],
         ],
     }
-
-
-def clear_dnd5e_search_inline_keyboard(user_id):
-    state = dnd5e_search_states.get(user_id)
-    if not state or current_platform != 'telegram':
-        return
-    msg_id = state.get('telegram_message_id')
-    if msg_id and telegram_chat_id is not None:
-        try:
-            telegram_api(
-                'editMessageReplyMarkup',
-                chat_id=telegram_chat_id,
-                message_id=msg_id,
-                reply_markup={'inline_keyboard': []},
-            )
-        except Exception as exc:
-            print('clear_dnd5e_search_inline_keyboard:', exc)
-
-
-def apply_dnd5e_search_selection(user_id, num):
-    """num: 1–5 — результат, 0 — отмена."""
-    state = dnd5e_search_states.get(user_id)
-    if not state:
-        return False
-    results = state.get('results', [])
-    if num == 0:
-        clear_dnd5e_search_inline_keyboard(user_id)
-        dnd5e_search_states.pop(user_id, None)
-        send_message('Поиск отменён.', keyboards.main_keyboard)
-        return True
-    if 1 <= num <= len(results):
-        clear_dnd5e_search_inline_keyboard(user_id)
-        dnd5e_search_states.pop(user_id, None)
-        r = results[num - 1]
-        send_message(f"[{r['type_label']}] {r['title']}\n{r['url']}", keyboards.main_keyboard)
-        return True
-    return False
 
 
 def search_dnd5e_handbook(query, limit=5):
@@ -1470,48 +1418,34 @@ def start_dnd5e_handbook_search(user_id, query):
     lines = [f'Поиск: «{query}»', '']
     for i, r in enumerate(results, 1):
         lines.append(f"{i}. [{r['type_label']}] {r['title']}")
-    lines.append('\nВыберите номер кнопкой под сообщением:')
+    lines.append('\nНажмите кнопку — откроется страница на dnd5e.club:')
     inline_kb = (
-        dnd5e_search_inline_keyboard_for_telegram(len(results))
+        dnd5e_search_inline_keyboard_for_telegram(results)
         if current_platform == 'telegram'
-        else make_dnd5e_search_inline_keyboard(len(results))
+        else make_dnd5e_search_inline_keyboard(results)
     )
-    sent = send_message('\n'.join(lines), inline_keyboard=inline_kb)
-    search_state = {'results': results}
-    if current_platform == 'telegram' and isinstance(sent, dict):
-        search_state['telegram_message_id'] = sent.get('message_id')
-    dnd5e_search_states[user_id] = search_state
+    send_message('\n'.join(lines), inline_keyboard=inline_kb)
+    # Состояние только для текстового ввода 1–5; кнопки работают без него
+    dnd5e_search_states[user_id] = {'results': results}
 
 
 def handle_dnd5e_search_selection(user_id, msg_stripped):
     state = dnd5e_search_states.get(user_id)
     if not state:
         return False
-    if msg_stripped.startswith('поиск '):
-        clear_dnd5e_search_inline_keyboard(user_id)
-        dnd5e_search_states.pop(user_id, None)
-        return False
-    if msg_stripped == 'поиск':
-        clear_dnd5e_search_inline_keyboard(user_id)
+    if msg_stripped.startswith('поиск ') or msg_stripped == 'поиск':
         dnd5e_search_states.pop(user_id, None)
         return False
     results = state.get('results', [])
-    if msg_stripped == 'назад':
-        apply_dnd5e_search_selection(user_id, 0)
-        return True
     if msg_stripped.isdigit():
         num = int(msg_stripped)
         if 1 <= num <= len(results):
-            apply_dnd5e_search_selection(user_id, num)
+            r = results[num - 1]
+            dnd5e_search_states.pop(user_id, None)
+            send_message(f"[{r['type_label']}] {r['title']}\n{r['url']}", keyboards.main_keyboard)
             return True
-        send_message(f'Нажмите кнопку от 1 до {len(results)} под сообщением или «Назад».')
-        return True
-    send_message(f'Нажмите кнопку от 1 до {len(results)} под сообщением или «Назад».')
-    return True
-
-
-def handle_dnd5e_search_callback(user_id, num):
-    return apply_dnd5e_search_selection(user_id, num)
+    dnd5e_search_states.pop(user_id, None)
+    return False
 
 
 def show_all_spells(character, show_keyboard=True, ttg_msg=True):
@@ -3764,7 +3698,7 @@ HELP_TOPICS = {
         "Поиск по всему справочнику: поиск <запрос>.\n"
         "Пример: поиск дракон или поиск fireball.\n"
         "Бот покажет до 5 результатов (заклинания, чудовища, предметы, классы, черты и др.) "
-        "и кнопки 1–5 под сообщением для выбора ссылки на dnd5e.club.\n"
+        "и кнопки 1–5 под сообщением — сразу открывают страницу на dnd5e.club.\n"
         "Индекс загружается при первом поиске. Обновить вручную: обновить поиск (или поиск обновить)."
     )),
     'кубики': ('Броски кубиков XdY и по характеристикам', (
@@ -3854,33 +3788,6 @@ def handle_bot_event(incoming_event):
     global event, chat_id, user_id, message_id
     event = incoming_event
 
-    if event.type == VkBotEventType.MESSAGE_EVENT:
-        obj = event.object
-        user_id = obj['user_id']
-        peer_id = obj['peer_id']
-        if peer_id != user_id:
-            chat_id = peer_id
-            message_id = peer_id
-        else:
-            chat_id = None
-            message_id = user_id
-        try:
-            payload = json.loads(obj.get('payload') or '{}')
-        except (json.JSONDecodeError, TypeError):
-            payload = {}
-        if 'd5search' in payload:
-            if vk:
-                try:
-                    vk.messages.sendMessageEventAnswer(
-                        event_id=obj['event_id'],
-                        user_id=user_id,
-                        peer_id=peer_id,
-                    )
-                except Exception as exc:
-                    print('sendMessageEventAnswer:', exc)
-            handle_dnd5e_search_callback(user_id, int(payload['d5search']))
-        return
-
     if event.type == VkBotEventType.MESSAGE_NEW:
         chat_id = event.chat_id
         user_id = event.obj.message['from_id']
@@ -3951,7 +3858,7 @@ def handle_bot_event(incoming_event):
         if dnd_ref_handled:
             return
 
-        # Поиск по справочнику dnd5e.club: выбор результата 1–5
+        # Поиск по справочнику dnd5e.club: текстовый ввод 1–5 (не блокирует другие команды)
         if user_id in dnd5e_search_states:
             if handle_dnd5e_search_selection(user_id, msg_stripped):
                 return
@@ -3975,7 +3882,7 @@ def handle_bot_event(incoming_event):
             send_message(
                 "Использование: поиск <запрос>\n"
                 "Например: поиск дракон или поиск fireball\n"
-                "Покажет до 5 результатов — нажмите кнопку 1–5 под сообщением.\n"
+                "Покажет до 5 результатов — кнопки 1–5 сразу открывают страницу на dnd5e.club.\n"
                 "Обновить индекс: обновить поиск"
             )
             return
@@ -4984,29 +4891,7 @@ def run_telegram_bot():
             updates = telegram_api('getUpdates', **params)
             for update in updates:
                 offset = update['update_id'] + 1
-                callback_query = update.get('callback_query')
-                if callback_query:
-                    data = callback_query.get('data') or ''
-                    if data.startswith('d5s:'):
-                        try:
-                            num = int(data.split(':', 1)[1])
-                        except ValueError:
-                            continue
-                        from_user = callback_query.get('from') or {}
-                        msg = callback_query.get('message') or {}
-                        chat = msg.get('chat') or {}
-                        with transport_lock:
-                            current_platform = 'telegram'
-                            telegram_chat_id = chat.get('id')
-                            telegram_message_id = msg.get('message_id')
-                            user_id = from_user.get('id')
-                            chat_id = None if chat.get('type') == 'private' else chat.get('id')
-                            message_id = telegram_chat_id if chat_id else user_id
-                            try:
-                                telegram_api('answerCallbackQuery', callback_query_id=callback_query['id'])
-                            except Exception as exc:
-                                print('answerCallbackQuery:', exc)
-                            handle_dnd5e_search_callback(user_id, num)
+                if update.get('callback_query'):
                     continue
                 message = update.get('message') or update.get('edited_message')
                 if not message:
