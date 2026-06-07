@@ -1229,9 +1229,7 @@ def get_dndsort_spell_link(spellname):
 
 
 DND5E_CLUB_BASE_URL = "https://dnd5e.club"
-DND5E_HANDBOOK_CACHE_TTL = 3600
 _dnd5e_handbook_cache = None
-_dnd5e_handbook_cache_time = 0
 
 DND5E_HANDBOOK_INDEX_QUERY = """
 query {
@@ -1311,10 +1309,10 @@ def _score_handbook_item(item, query_norm, query_tokens):
     return score
 
 
-def get_dnd5e_handbook_index():
-    global _dnd5e_handbook_cache, _dnd5e_handbook_cache_time
-    now = time.time()
-    if _dnd5e_handbook_cache is not None and now - _dnd5e_handbook_cache_time < DND5E_HANDBOOK_CACHE_TTL:
+def get_dnd5e_handbook_index(force=False):
+    """Возвращает кэш индекса справочника. Обновляется при первом поиске или по команде «обновить поиск»."""
+    global _dnd5e_handbook_cache
+    if not force and _dnd5e_handbook_cache is not None:
         return _dnd5e_handbook_cache
     try:
         resp = requests.post(
@@ -1340,8 +1338,23 @@ def get_dnd5e_handbook_index():
                 'type_label': type_label,
             })
     _dnd5e_handbook_cache = index
-    _dnd5e_handbook_cache_time = now
     return index
+
+
+def refresh_dnd5e_handbook_index():
+    """Принудительно перезагружает индекс с dnd5e.club. Возвращает (index, had_cache, prev_count)."""
+    had_cache = _dnd5e_handbook_cache is not None
+    prev_count = len(_dnd5e_handbook_cache) if had_cache else 0
+    return get_dnd5e_handbook_index(force=True), had_cache, prev_count
+
+
+def send_dnd5e_handbook_refresh_message(index, had_cache, prev_count):
+    if not index:
+        send_message('Не удалось обновить индекс поиска. Попробуйте позже.')
+    elif not had_cache:
+        send_message(f'Индекс поиска загружен: {len(index)} записей.')
+    else:
+        send_message(f'Индекс поиска обновлён: {len(index)} записей (было {prev_count}).')
 
 
 def dnd5e_handbook_item_url(item):
@@ -3751,7 +3764,8 @@ HELP_TOPICS = {
         "Поиск по всему справочнику: поиск <запрос>.\n"
         "Пример: поиск дракон или поиск fireball.\n"
         "Бот покажет до 5 результатов (заклинания, чудовища, предметы, классы, черты и др.) "
-        "и кнопки 1–5 под сообщением для выбора ссылки на dnd5e.club."
+        "и кнопки 1–5 под сообщением для выбора ссылки на dnd5e.club.\n"
+        "Индекс загружается при первом поиске. Обновить вручную: обновить поиск (или поиск обновить)."
     )),
     'кубики': ('Броски кубиков XdY и по характеристикам', (
         "• Формула XdY: 2d6, d20, 10d100. С модификатором: 3d20+4.\n"
@@ -3942,10 +3956,17 @@ def handle_bot_event(incoming_event):
             if handle_dnd5e_search_selection(user_id, msg_stripped):
                 return
 
+        # Обновление индекса поиска по dnd5e.club
+        if msg_stripped in ('обновить поиск', 'поиск обновить'):
+            send_dnd5e_handbook_refresh_message(*refresh_dnd5e_handbook_index())
+            return
+
         # Поиск по справочнику dnd5e.club
         if msg_stripped.startswith('поиск '):
             query = original_message_text.strip()[len('поиск '):].strip()
-            if query:
+            if query.lower() == 'обновить':
+                send_dnd5e_handbook_refresh_message(*refresh_dnd5e_handbook_index())
+            elif query:
                 start_dnd5e_handbook_search(user_id, query)
             else:
                 send_message("Укажите запрос после команды, например: поиск дракон")
@@ -3954,7 +3975,8 @@ def handle_bot_event(incoming_event):
             send_message(
                 "Использование: поиск <запрос>\n"
                 "Например: поиск дракон или поиск fireball\n"
-                "Покажет до 5 результатов — нажмите кнопку 1–5 под сообщением."
+                "Покажет до 5 результатов — нажмите кнопку 1–5 под сообщением.\n"
+                "Обновить индекс: обновить поиск"
             )
             return
 
