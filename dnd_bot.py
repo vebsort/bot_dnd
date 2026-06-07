@@ -53,8 +53,6 @@ transport_lock = threading.RLock()
 
 # Состояния пользователей (для простой машины состояний)
 user_states = {}
-# Ожидание текстового ввода 1–5 после поиска (кнопки url работают без состояния)
-dnd5e_search_states = {}
 user_warnings = {}
 # Последний бросок по user_id для переброса вдохновением (-вдох)
 last_roll_by_user = {}
@@ -151,7 +149,7 @@ def download_character_photo(photo_attachment, image_url=None, vk_api_obj=None):
 
 
 #функция отправки сообщения (в зависимости от лички/беседы меняет параметры)
-def send_message(message, keyboard=None, attachment=None, remove_keyboard=False, inline_keyboard=None):
+def send_message(message, keyboard=None, attachment=None, remove_keyboard=False, inline_keyboard=None, parse_mode=None):
     """Отправляет сообщение пользователю. attachment — строка вложения VK (например, photo123_456)."""
     if current_platform == 'telegram':
         send_telegram_message(
@@ -160,6 +158,7 @@ def send_message(message, keyboard=None, attachment=None, remove_keyboard=False,
             attachment=attachment,
             remove_keyboard=remove_keyboard,
             inline_keyboard=inline_keyboard,
+            parse_mode=parse_mode,
         )
         return
 
@@ -218,7 +217,7 @@ def vk_keyboard_to_telegram_markup(keyboard):
     }
 
 
-def send_telegram_message(message, keyboard=None, attachment=None, remove_keyboard=False, inline_keyboard=None):
+def send_telegram_message(message, keyboard=None, attachment=None, remove_keyboard=False, inline_keyboard=None, parse_mode=None):
     global telegram_last_reply_markup_by_chat
     if inline_keyboard is not None:
         reply_markup = inline_keyboard
@@ -236,6 +235,9 @@ def send_telegram_message(message, keyboard=None, attachment=None, remove_keyboa
         'chat_id': telegram_chat_id,
         'text': message,
     }
+    if parse_mode:
+        params['parse_mode'] = parse_mode
+        params['disable_web_page_preview'] = True
     if reply_markup:
         params['reply_markup'] = reply_markup
 
@@ -244,6 +246,8 @@ def send_telegram_message(message, keyboard=None, attachment=None, remove_keyboa
         with open(photo_path, 'rb') as photo_file:
             files = {'photo': photo_file}
             data = {'chat_id': telegram_chat_id, 'caption': message}
+            if parse_mode:
+                data['parse_mode'] = parse_mode
             if reply_markup:
                 data['reply_markup'] = json.dumps(reply_markup, ensure_ascii=False)
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -1361,26 +1365,28 @@ def dnd5e_handbook_item_url(item):
     return f"{DND5E_CLUB_BASE_URL}/{item['url_path']}/{item['id']}"
 
 
-def make_dnd5e_search_inline_keyboard(results):
-    """Inline-клавиатура: кнопки 1–N сразу открывают ссылку на dnd5e.club."""
-    return {
-        'inline': True,
-        'buttons': [[{
-            'action': {
-                'type': 'open_link',
-                'link': r['url'],
-                'label': str(i),
-            },
-        } for i, r in enumerate(results, 1)]],
-    }
+def _escape_telegram_html(text):
+    return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
-def dnd5e_search_inline_keyboard_for_telegram(results):
-    return {
-        'inline_keyboard': [
-            [{'text': str(i), 'url': r['url']} for i, r in enumerate(results, 1)],
-        ],
-    }
+def _vk_link_text(text):
+    return str(text).replace('|', ' ').replace('[', '(').replace(']', ')')
+
+
+def format_dnd5e_search_results_message(query, results):
+    lines = [f'Поиск: «{query}»', '']
+    for i, r in enumerate(results, 1):
+        type_label = r['type_label']
+        title = r['title']
+        url = r['url']
+        if current_platform == 'telegram':
+            lines.append(
+                f"{i}. [{_escape_telegram_html(type_label)}] "
+                f"<a href=\"{url}\">{_escape_telegram_html(title)}</a>"
+            )
+        else:
+            lines.append(f"{i}. [{type_label}] [{url}|{_vk_link_text(title)}]")
+    return '\n'.join(lines)
 
 
 def search_dnd5e_handbook(query, limit=5):
@@ -1405,7 +1411,6 @@ def search_dnd5e_handbook(query, limit=5):
 
 
 def start_dnd5e_handbook_search(user_id, query):
-    dnd5e_search_states.pop(user_id, None)
     try:
         results = search_dnd5e_handbook(query, limit=5)
     except Exception as e:
@@ -1415,37 +1420,11 @@ def start_dnd5e_handbook_search(user_id, query):
     if not results:
         send_message(f'По запросу «{query}» ничего не найдено в справочнике dnd5e.club.')
         return
-    lines = [f'Поиск: «{query}»', '']
-    for i, r in enumerate(results, 1):
-        lines.append(f"{i}. [{r['type_label']}] {r['title']}")
-    lines.append('\nНажмите кнопку — откроется страница на dnd5e.club:')
-    inline_kb = (
-        dnd5e_search_inline_keyboard_for_telegram(results)
-        if current_platform == 'telegram'
-        else make_dnd5e_search_inline_keyboard(results)
-    )
-    send_message('\n'.join(lines), inline_keyboard=inline_kb)
-    # Состояние только для текстового ввода 1–5; кнопки работают без него
-    dnd5e_search_states[user_id] = {'results': results}
-
-
-def handle_dnd5e_search_selection(user_id, msg_stripped):
-    state = dnd5e_search_states.get(user_id)
-    if not state:
-        return False
-    if msg_stripped.startswith('поиск ') or msg_stripped == 'поиск':
-        dnd5e_search_states.pop(user_id, None)
-        return False
-    results = state.get('results', [])
-    if msg_stripped.isdigit():
-        num = int(msg_stripped)
-        if 1 <= num <= len(results):
-            r = results[num - 1]
-            dnd5e_search_states.pop(user_id, None)
-            send_message(f"[{r['type_label']}] {r['title']}\n{r['url']}", keyboards.main_keyboard)
-            return True
-    dnd5e_search_states.pop(user_id, None)
-    return False
+    message = format_dnd5e_search_results_message(query, results)
+    if current_platform == 'telegram':
+        send_message(message, parse_mode='HTML')
+    else:
+        send_message(message)
 
 
 def show_all_spells(character, show_keyboard=True, ttg_msg=True):
@@ -3697,8 +3676,7 @@ HELP_TOPICS = {
     'поиск': ('Поиск по справочнику dnd5e.club', (
         "Поиск по всему справочнику: поиск <запрос>.\n"
         "Пример: поиск дракон или поиск fireball.\n"
-        "Бот покажет до 5 результатов (заклинания, чудовища, предметы, классы, черты и др.) "
-        "и кнопки 1–5 под сообщением — сразу открывают страницу на dnd5e.club.\n"
+        "Бот покажет до 5 результатов — название каждого элемента будет ссылкой на dnd5e.club.\n"
         "Индекс загружается при первом поиске. Обновить вручную: обновить поиск (или поиск обновить)."
     )),
     'кубики': ('Броски кубиков XdY и по характеристикам', (
@@ -3858,11 +3836,6 @@ def handle_bot_event(incoming_event):
         if dnd_ref_handled:
             return
 
-        # Поиск по справочнику dnd5e.club: текстовый ввод 1–5 (не блокирует другие команды)
-        if user_id in dnd5e_search_states:
-            if handle_dnd5e_search_selection(user_id, msg_stripped):
-                return
-
         # Обновление индекса поиска по dnd5e.club
         if msg_stripped in ('обновить поиск', 'поиск обновить'):
             send_dnd5e_handbook_refresh_message(*refresh_dnd5e_handbook_index())
@@ -3882,7 +3855,7 @@ def handle_bot_event(incoming_event):
             send_message(
                 "Использование: поиск <запрос>\n"
                 "Например: поиск дракон или поиск fireball\n"
-                "Покажет до 5 результатов — кнопки 1–5 сразу открывают страницу на dnd5e.club.\n"
+                "Покажет до 5 результатов — названия будут ссылками на dnd5e.club.\n"
                 "Обновить индекс: обновить поиск"
             )
             return
