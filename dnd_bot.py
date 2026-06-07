@@ -7,6 +7,8 @@ import re
 import json
 import os
 import tempfile
+import threading
+import time
 from urllib.parse import quote
 import requests
 import dnd5e_data
@@ -16,16 +18,38 @@ from dnd_character_generator import generate_character # Это ваш моду�
 import character_sheet_image
 
 # Настройки бота
-GROUP_ID = '179538565'
-TOKEN = 'vk1.a.Gntrp6vhQlJziwlEvLLjdukd2V3jbJW0BAwU19plh7Xmwf3EoDeypRyP-M5AsdcjOrb81e98s9HdGq1nbDnHjIevKn1qj-l5TOteOGS86jdDjDEPD_mV4nGKELzu9Amr0ExDI1q6YjYRKO4heMN1QjegoDwatNIPlAnRKLOuz40koSjYX6Llhzcy6XBN0eXHl5YS_rj1Ix5_fglGiEuMWg'
+def load_config():
+    config_path = os.getenv('BOT_CONFIG', 'config.json')
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, 'r', encoding='utf-8') as config_file:
+        return json.load(config_file)
+
+
+CONFIG = load_config()
+
+
+def get_setting(name, default=None):
+    return os.getenv(name) or CONFIG.get(name) or default
+
+
+GROUP_ID = get_setting('VK_GROUP_ID', '179538565')
+TOKEN = get_setting('VK_TOKEN')
+TELEGRAM_BOT_TOKEN = get_setting('TELEGRAM_BOT_TOKEN')
+TELEGRAM_BOT_USERNAME = get_setting('TELEGRAM_BOT_USERNAME', '').lstrip('@').lower()
+BOT_PLATFORM = get_setting('BOT_PLATFORM', 'vk').lower()
 
 symbol = '/'
 
-# Инициализация API ВКонтакте
-vk_session = vk_api.VkApi(token=TOKEN)
-longpoll = VkBotLongPoll(vk_session, GROUP_ID)
-vk = vk_session.get_api()
-vk_upload = VkUpload(vk_session)
+# Инициализация API выполняется при запуске нужного транспорта.
+vk_session = None
+longpoll = None
+vk = None
+vk_upload = None
+current_platform = 'vk'
+telegram_chat_id = None
+telegram_message_id = None
+transport_lock = threading.RLock()
 
 # Состояния пользователей (для простой машины состояний)
 user_states = {}
@@ -41,6 +65,8 @@ def get_photo_attachment(attachments):
     for att in attachments:
         if att.get('type') == 'photo':
             ph = att.get('photo', {})
+            if ph.get('url'):
+                return f"url:{ph['url']}"
             oid = ph.get('owner_id')
             pid = ph.get('id')
             if oid is not None and pid is not None:
@@ -125,6 +151,10 @@ def download_character_photo(photo_attachment, image_url=None, vk_api_obj=None):
 #функция отправки сообщения (в зависимости от лички/беседы меняет параметры)
 def send_message(message, keyboard=None, attachment=None):
     """Отправляет сообщение пользователю. attachment — строка вложения VK (например, photo123_456)."""
+    if current_platform == 'telegram':
+        send_telegram_message(message, keyboard=keyboard, attachment=attachment)
+        return
+
     if event.chat_id != None:
         params = {
             'chat_id': message_id,
@@ -143,6 +173,71 @@ def send_message(message, keyboard=None, attachment=None):
         params['attachment'] = attachment
 
     vk.messages.send(**params)
+
+
+def telegram_api(method, **params):
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError('TELEGRAM_BOT_TOKEN is not set')
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    response = requests.post(url, json=params, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get('ok'):
+        raise RuntimeError(payload)
+    return payload['result']
+
+
+def vk_keyboard_to_telegram_markup(keyboard):
+    if not keyboard:
+        return None
+    rows = []
+    for row in keyboard.get('buttons', []):
+        labels = []
+        for button in row:
+            label = button.get('action', {}).get('label')
+            if label:
+                labels.append(label)
+        if labels:
+            rows.append(labels)
+    if not rows:
+        return None
+    return {
+        'keyboard': rows,
+        'resize_keyboard': True,
+        'one_time_keyboard': bool(keyboard.get('one_time')),
+    }
+
+
+def send_telegram_message(message, keyboard=None, attachment=None):
+    reply_markup = vk_keyboard_to_telegram_markup(keyboard)
+    params = {
+        'chat_id': telegram_chat_id,
+        'text': message,
+    }
+    if reply_markup:
+        params['reply_markup'] = reply_markup
+
+    photo_path = attachment if attachment and os.path.exists(str(attachment)) else None
+    if photo_path:
+        with open(photo_path, 'rb') as photo_file:
+            files = {'photo': photo_file}
+            data = {'chat_id': telegram_chat_id, 'caption': message}
+            if reply_markup:
+                data['reply_markup'] = json.dumps(reply_markup, ensure_ascii=False)
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+            response = requests.post(url, data=data, files=files, timeout=60)
+            response.raise_for_status()
+        return
+
+    telegram_api('sendMessage', **params)
+
+
+def get_telegram_file_url(file_id):
+    file_info = telegram_api('getFile', file_id=file_id)
+    file_path = file_info.get('file_path')
+    if not file_path:
+        return None
+    return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
 
 #Вывод сообщения при выходе из других меню в главное
 def main_menu_message():
@@ -3358,7 +3453,37 @@ def show_help(message_id, topic=None):
         send_message("Список команд: Создать персонажа, Мои персонажи, Редакция (2014/2024), Помощь, Напарник (нап), Справка (справ/dnd/спр), Кубики XdY и по навыкам, Инициатива (ини). Напишите «помощь команда» для подробностей.")
 
 # Основной цикл бота
-for event in longpoll.listen():
+class _TelegramObject:
+    def __init__(self, message):
+        self.message = message
+
+
+class _TelegramEvent:
+    def __init__(self, update):
+        message = update.get('message') or update.get('edited_message') or {}
+        chat = message.get('chat') or {}
+        from_user = message.get('from') or {}
+        text = message.get('text') or message.get('caption') or ''
+        attachments = []
+        photos = message.get('photo') or []
+        if photos:
+            best_photo = photos[-1]
+            file_url = get_telegram_file_url(best_photo['file_id'])
+            if file_url:
+                attachments.append({'type': 'photo', 'photo': {'url': file_url}})
+        self.type = VkBotEventType.MESSAGE_NEW
+        self.chat_id = None if chat.get('type') == 'private' else chat.get('id')
+        self.message = {'text': text, 'attachments': attachments}
+        self.obj = _TelegramObject({
+            'from_id': from_user.get('id') or chat.get('id'),
+            'text': text,
+            'attachments': attachments,
+        })
+
+
+def handle_bot_event(incoming_event):
+    global event, chat_id, user_id, message_id
+    event = incoming_event
     if event.type == VkBotEventType.MESSAGE_NEW:
         chat_id = event.chat_id
         user_id = event.obj.message['from_id']
@@ -3368,9 +3493,9 @@ for event in longpoll.listen():
                 or f'@ezgamednd' in event.message.get('text')) == False:
                     if user_id in user_states:
                         if user_states[user_id]['namestate'] == False:
-                            continue # Пропуск сообщения, если боту пишут в чат без упоминания или не пишут '/' перед сообщением
+                            return # Пропуск сообщения, если боту пишут в чат без упоминания или не пишут '/' перед сообщением
                     else:
-                        continue
+                        return
         else: message_id = user_id
 
         message_text = event.obj.message['text'] # Получение сообщения пользователя
@@ -3438,7 +3563,7 @@ for event in longpoll.listen():
             send_message("Использование: справка <запрос>\nНапример: справка огненный шар\nИли: спр закл 1 — ссылка на заклинание по номеру в списке.")
             dnd_ref_handled = True
         if dnd_ref_handled:
-            continue
+            return
 
         # --- Напарники: список, добавление и просмотр ---
         companions = load_companions(user_id)
@@ -3446,7 +3571,7 @@ for event in longpoll.listen():
         # Только «нап» / «напарник» / «напар» без аргументов — список напарников
         if msg_stripped in ('напарник', 'нап', 'напар'):
             send_message(companions_list_text(companions))
-            continue
+            return
         # Удалить напарника: нап уд [кличка] / нап удалить [кличка]
         _words = msg_stripped.split()
         if len(_words) >= 3 and _words[0] == 'нап' and _words[1] in ('уд', 'удалить'):
@@ -3463,7 +3588,7 @@ for event in longpoll.listen():
                 send_message(f"Напарник «{name}» (кличка {nick}) удалён.")
             else:
                 send_message("Нет напарника с такой кличкой. Удаление: нап уд [кличка] или нап удалить [кличка]")
-            continue
+            return
         # Добавить напарника: "напарник Имя [кличка]" / "нап Имя [кличка]" / "напар Имя [кличка]"
         for add_cmd in ('напарник ', 'нап ', 'напар '):
             if msg_stripped.startswith(add_cmd):
@@ -3483,11 +3608,11 @@ for event in longpoll.listen():
                 companion_handled = True
                 break
         if companion_handled:
-            continue
+            return
         # Показать карточку напарника по кличке (точное совпадение)
         if msg_stripped in companions:
             send_message(companion_card_text(companions[msg_stripped]))
-            continue
+            return
         # Команды напарника (раздельные слова): [кличка] исп лов, [кличка] атк, [кличка] ини 5 и т.д.
         _words = msg_stripped.split()
         if len(_words) >= 2 and _words[0] in companions:
@@ -3579,15 +3704,15 @@ for event in longpoll.listen():
                 save_companions(user_id, companions)
                 companion_handled = True
         if companion_handled:
-            continue
+            return
 
         # Помощь: только «помощь» (пом — помеха в бросках)
         if msg_stripped == "помощь":
             show_help(message_id)
-            continue
+            return
         if msg_stripped.startswith("помощь "):
             show_help(message_id, msg_stripped[7:].strip())
-            continue
+            return
 
         # Проверяем, находится ли пользователь в каком-либо из процессов (создание персонажа, управление персонажами)
 
@@ -3603,10 +3728,10 @@ for event in longpoll.listen():
                         send_message(f"Ваша Кость здоровья — d{hitdie}. Вы можете кинуть ее и добавить ваш модификатор Выносливости ({sign_con}{con_mod}).\n\nВместо броска взять среднее значение: {average+con_mod}.\n\nТакже можете ввести насколько повысится ваш максимум ПЗ вручную, если бросаете кость вживую (максимум — {hitdie+con_mod})", keyboard_maker(array_to_text_color_array(
                                         ["Кинуть","Среднее","Вручную"]),onetime=True))
                         state['step'] = 2
-                        continue
+                        return
                     if message_text == 'нет':
                         exit_state(show_message=False)
-                        continue
+                        return
                     else:
                         send_message(f"Выберите \"да\" или \"нет\".",keyboard=keyboard_maker(array_to_text_color_array(["Да","Нет"]),keyboard_columns=2,onetime=True))
 
@@ -3634,7 +3759,7 @@ for event in longpoll.listen():
                     change_param(char, 'max_hit_points', newmaxhp)
                     send_message(f"Максимум ПЗ успешно узменен. Новый максимум — {newmaxhp} ПЗ.")
                     exit_state(show_message=False)
-                    continue
+                    return
 
 
         if chat_id == None:
@@ -3642,7 +3767,7 @@ for event in longpoll.listen():
                 if user_id in user_states:
                     exit_state(show_message=False)
                 main_menu_message()
-                continue
+                return
         if user_id in user_states:
             attachments = event.obj.message.get('attachments', [])
             if user_states[user_id]['state'] == 'choose_edition':
@@ -3659,14 +3784,14 @@ for event in longpoll.listen():
                     del user_states[user_id]
                 else:
                     send_message("Выберите редакцию: 2014 или 2024.", keyboards.edition_keyboard)
-                continue
+                return
             print(user_states[user_id]['step'])
             if user_states[user_id]['state'] == 'create_character':
                 create_character_flow(user_id, user_states[user_id]['step'], message_text, attachments)
             elif user_states[user_id]['state'] == 'manage_character':
                 manage_character_flow(user_id, user_states[user_id]['step'], message_text, attachments)
 
-            continue
+            return
 
         # Вдохновение: вдох (показать), +вдох (получить), -вдох (переброс последней кости)
         if msg_stripped in ('вдох', '+вдох', '-вдох'):
@@ -3674,7 +3799,7 @@ for event in longpoll.listen():
                 char = load_main_character(user_id)
             except (IndexError, TypeError):
                 send_message("Персонаж не подключен. Создайте или выберите персонажа.")
-                continue
+                return
             if msg_stripped == 'вдох':
                 send_message("Вдохновение: ✨" if char['inspiration'] else "Вдохновение: нет")
             elif msg_stripped == '+вдох':
@@ -3683,15 +3808,15 @@ for event in longpoll.listen():
             else:  # -вдох
                 if not char['inspiration']:
                     send_message("Вдохновения нет.")
-                    continue
+                    return
                 last = last_roll_by_user.get(user_id)
                 if not last:
                     send_message("Не было броска для переброса. Сначала сделайте бросок (например, проверку или d20).")
-                    continue
+                    return
                 change_param(char, 'inspiration', False)
                 roll(character=last['character'], amount=last['amount'], die=last['die'], skill_name=last['skill_name'],
                      custom_mod=last['custom_mod'], has_message=True, adv=last['adv'], user_id=user_id)
-            continue
+            return
 
         # Сложные формулы: несколько костей (d20+d4) или несколько модификаторов (3d20+4+8 → 3d20+12)
         parsed = parse_complex_dice(message_text)
@@ -3701,7 +3826,7 @@ for event in longpoll.listen():
             use_complex = len(dice_terms) > 1 or "+" in normalized
             if use_complex:
                 roll_complex_dice(dice_terms, total_mod, has_message=True)
-                continue
+                return
 
         if is_xdy_format(message_text): #обработка броска кубиков
             parts = message_text.split('d')
@@ -3729,7 +3854,7 @@ for event in longpoll.listen():
 
                 characters = load_characters(user_id)
                 roll(characters[get_main_char_id(user_id) - 1], amount, die, has_message=True, custom_mod = mod, user_id=user_id)
-                continue
+                return
             except ValueError:
                 send_message("Пожалуйста, введите правильное значение кости в формате XdY.", keyboards.main_keyboard)
             except IndexError:
@@ -3737,8 +3862,8 @@ for event in longpoll.listen():
                     send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.")
                     user_warnings[user_id] = ''
                 roll(character='none', amount=amount, die=die, has_message=True, custom_mod=mod, user_id=user_id)
-                continue
-            continue
+                return
+            return
         
         # Бросок по испытанию: раздельные команды «исп лвк», «исп ловкость», «испытание муд» и т.д.
         _roll_words = msg_stripped.split()
@@ -3766,22 +3891,22 @@ for event in longpoll.listen():
                     send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
                     user_warnings[user_id] = ''
                 roll(character='none', amount=1, die=20, has_message=True, user_id=user_id)
-            continue
+            return
         elif message_text in dnd5e_data.code_word_list:
             if not ('пом' in message_text or 'пре' in message_text):
                 if message_text in ['ини', 'иниц', 'инициатива']:
                     roll_initiative_with_companions(user_id)
-                    continue
+                    return
                 try:
                     characters = load_characters(user_id)
                     roll(characters[get_main_char_id(user_id) - 1], skill_name=message_text, has_message=True, user_id=user_id)
-                    continue
+                    return
                 except IndexError:
                     if not user_id in user_warnings:
                         send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
                         user_warnings[user_id] = ''
                     roll(character='none', amount=1, die=20, has_message=True, user_id=user_id) 
-                    continue   
+                    return   
 
         # Помеха/преимущество: поддерживаем как слитно (прелов), так и раздельно (пре лов / пре исп лвк)
         # Важно: если формат не распознан — не делаем fallback в другой бросок.
@@ -3826,7 +3951,7 @@ for event in longpoll.listen():
                             skill_tag = _adv_words[2]
                         else:
                             send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
-                            continue
+                            return
 
                     try:
                         characters = load_characters(user_id)
@@ -3836,7 +3961,7 @@ for event in longpoll.listen():
                             send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
                             user_warnings[user_id] = ''
                         roll(character='none', amount=1, die=20, has_message=True, adv=adv, user_id=user_id)
-                    continue
+                    return
 
                 # 2) Раздельный формат проверок навыка/характеристики: пре лов / пом про / пре акр / т.п.
                 if len(_adv_words) == 2 and _adv_words[0] == adv:
@@ -3850,9 +3975,9 @@ for event in longpoll.listen():
                                 send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
                                 user_warnings[user_id] = ''
                             roll(character='none', amount=1, die=20, has_message=True, adv=adv, user_id=user_id)
-                        continue
+                        return
                     send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
-                    continue
+                    return
 
                 # 3) Слитный формат (без пробелов): прелов / помпро / пре+5 / пом-2
                 _joined = msg_stripped.replace(" ", "")
@@ -3864,9 +3989,9 @@ for event in longpoll.listen():
                             mod = int(rest)
                         except ValueError:
                             send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
-                            continue
+                            return
                         roll(character='none', die=20, has_message=True, adv=adv, custom_mod=mod, user_id=user_id)
-                        continue
+                        return
                     # пре<код>
                     if rest in dnd5e_data.code_word_list:
                         try:
@@ -3877,14 +4002,14 @@ for event in longpoll.listen():
                                 send_message("Персонаж не подключен. Создайте персонажа, чтобы роллить с учетом его характеристик.", keyboard=keyboards.main_keyboard)
                                 user_warnings[user_id] = ''
                             roll(character='none', amount=1, die=20, has_message=True, adv=adv, user_id=user_id)
-                        continue
+                        return
 
                 send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
-                continue
+                return
 
             except (ValueError, KeyError):
                 send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
-                continue
+                return
         try:
             # Ячейки заклинаний: -яч 1 / -яч1 (потратить), +яч 1 2 (восстановить). Для колдуна: +яч / -яч / +яч 2 (без круга).
             _msg = message_text.strip().lower()
@@ -3893,13 +4018,13 @@ for event in longpoll.listen():
                 rest = _msg[1:].strip()  # "яч 1 2" или "яч1 2" или "яч" или "яч 2"
                 if not rest.startswith('яч'):
                     send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
-                    continue
+                    return
                 rest = rest[2:].strip()  # "1 2" / "1" / "" / "2"
                 try:
                     char = load_main_character(user_id)
                 except (IndexError, TypeError):
                     send_message("Персонаж не подключен.", keyboard=keyboards.main_keyboard)
-                    continue
+                    return
                 is_warlock = (char.get('class') or '').lower() == 'колдун'
                 parts = rest.split() if rest else []
 
@@ -3908,7 +4033,7 @@ for event in longpoll.listen():
                     amount = int(parts[0]) if len(parts) == 1 else 1
                     if amount < 1:
                         send_message("Количество — не менее 1.", keyboard=keyboards.main_keyboard)
-                        continue
+                        return
                     level = max(1, min(20, int(char.get('level', 1))))
                     # Таблица колдуна: уровень -> (круг ячеек, макс. ячеек). PHB 5e.
                     if level == 1:
@@ -3950,20 +4075,20 @@ for event in longpoll.listen():
                     change_param(char, 'current_spell_slots', curr)
                     change_param(char, 'spell_slots', max_slots)
                     send_message(f"Ячейки колдуна ({circle}-й круг): теперь {new_val} из {max_for_circle}.")
-                    continue
+                    return
 
                 if not rest:
                     send_message("Укажите круг (1–9), например: -яч 1 или +яч 1 2. Колдун: -яч / +яч без числа.", keyboard=keyboards.main_keyboard)
-                    continue
+                    return
                 try:
                     circle = int(parts[0])
                     amount = int(parts[1]) if len(parts) > 1 else 1
                 except (ValueError, IndexError):
                     send_message("Команда не распознана. Формат: -яч 1 (потратить), +яч 1 2 (восстановить 2 ячейки 1 круга).", keyboard=keyboards.main_keyboard)
-                    continue
+                    return
                 if circle < 1 or circle > 9 or amount < 1:
                     send_message("Круг — от 1 до 9, количество — не менее 1.", keyboard=keyboards.main_keyboard)
-                    continue
+                    return
                 try:
                     curr = char['current_spell_slots']
                     max_slots = char['spell_slots']
@@ -3975,7 +4100,7 @@ for event in longpoll.listen():
                 max_for_circle = max_slots[circle] if circle < len(max_slots) else 0
                 if max_for_circle == 0:
                     send_message(f"У персонажа нет ячеек {circle}-го круга.", keyboard=keyboards.main_keyboard)
-                    continue
+                    return
                 cur_val = curr[circle] if circle < len(curr) else 0
                 new_val = cur_val + sign * amount
                 new_val = max(0, min(max_for_circle, new_val))
@@ -3983,7 +4108,7 @@ for event in longpoll.listen():
                 char['current_spell_slots'] = curr
                 change_param(char, 'current_spell_slots', curr)
                 send_message(f"Ячейки {circle}-го круга: теперь {new_val} из {max_for_circle}.")
-                continue
+                return
 
             # Команда «сн очистить …» / «сн очисть …» / «сн очист …» — удалить ВСЕ предметы с указанным названием (по имени)
             _msg_lower = message_text.strip().lower()
@@ -4073,7 +4198,7 @@ for event in longpoll.listen():
                         equipment_cmd_handled = True
                         break
             if equipment_cmd_handled:
-                continue
+                return
             if message_text in dnd5e_data.code_fast_no_value:
                 if message_text in ['снар', 'снаряжение', 'сн', 'экип', 'экипировка']:
                     char = load_main_character(user_id)
@@ -4125,14 +4250,14 @@ for event in longpoll.listen():
                         change_param(char,'hit_dice_count',hit_dice_new_curr)
                         send_message(f"Уровень успешно повышен. Теперь вы {lvl+1} уровня. Хотите ли изменить максимум пунктов здоровья?",keyboard=keyboard_maker(array_to_text_color_array(["Да","Нет"]),keyboard_columns=2,onetime=True))
                         user_states[user_id] = {'character': char, 'state': 'hpincrease', 'step': 1}
-                continue
+                return
             elif message_text == 'я':
                 try:
                     char = load_main_character(user_id)
                     send_message(char_sheet_message(char))
                 except Exception:
                     send_message("Не удалось загрузить персонажа. Проверьте, что выбран основной персонаж.")
-                continue
+                return
             elif message_text == 'лист':
                 sheet_path = None
                 portrait_path = None
@@ -4141,13 +4266,16 @@ for event in longpoll.listen():
                     if char.get('image'):
                         portrait_path = download_character_photo(char['image'], image_url=char.get('image_url'))
                     sheet_path = character_sheet_image.generate_character_sheet_image(char, portrait_path=portrait_path)
-                    peer_id = (2000000000 + message_id) if chat_id is not None else message_id
-                    photo_list = vk_upload.photo_messages(sheet_path, peer_id=peer_id)
-                    if photo_list and len(photo_list) > 0:
-                        att = f"photo{photo_list[0]['owner_id']}_{photo_list[0]['id']}"
-                        send_message("Лист персонажа:", attachment=att)
+                    if current_platform == 'telegram':
+                        send_message("Лист персонажа:", attachment=sheet_path)
                     else:
-                        send_message(char_sheet_message(char))
+                        peer_id = (2000000000 + message_id) if chat_id is not None else message_id
+                        photo_list = vk_upload.photo_messages(sheet_path, peer_id=peer_id)
+                        if photo_list and len(photo_list) > 0:
+                            att = f"photo{photo_list[0]['owner_id']}_{photo_list[0]['id']}"
+                            send_message("Лист персонажа:", attachment=att)
+                        else:
+                            send_message(char_sheet_message(char))
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -4168,10 +4296,10 @@ for event in longpoll.listen():
                             os.remove(portrait_path)
                         except OSError:
                             pass
-                continue
+                return
             elif message_text == 'навыки':
                 show_all_skills(load_main_character(user_id),horizontal_format=True, show_all=True)
-                continue
+                return
 
             elif message_text[0:2] in dnd5e_data.code_fast_value:
                 if len(message_text)>2:
@@ -4197,10 +4325,10 @@ for event in longpoll.listen():
                             sign2 = ''
                         if (not value2.isdigit()) or original_value[0] == '+' or original_value[0] == '-':
                             send_message("Неверный формат бонуса.")
-                            continue
+                            return
                     if len(parts) <1:
                         send_message("Неверный формат бонуса.")
-                        continue
+                        return
                     
                     
                     code = parts[0]
@@ -4217,16 +4345,16 @@ for event in longpoll.listen():
                             value = int(value)
                         except ValueError:
                             send_message("Неверный формат бонуса.")
-                            continue
+                            return
                         except IndexError:
                             send_message("Неверный формат бонуса.")
-                            continue
+                            return
             
                     if sign == '-':
                         value = value * -1
                     elif sign != '+' and sign !='':
                         send_message("Неверный формат бонуса.")
-                        continue
+                        return
                     if code in ['кб']:
                         char = load_main_character(user_id)
                         if value >= 0:
@@ -4256,7 +4384,7 @@ for event in longpoll.listen():
                             else:
                                 send_message(f"Вы убрали из инвентаря предмет «{original_value}» в количестве {value2}.")
                         elif check == -1:
-                            continue
+                            return
                     if code in ['ко']:
                         char = load_main_character(user_id)
                         hp = char['hit_points']
@@ -4265,7 +4393,7 @@ for event in longpoll.listen():
                         con_mod = dnd5e_data.calc_mod(char['stats']['constitution'])
                         if value > char['hit_dice_count'] or value < 1:
                             send_message("Неправильное количество КЗ.")
-                            continue
+                            return
                         newhp = 0
                         for i in range(value):
                             newhp += roll(char, 1, hitdie, 'вын', has_message=True, user_id=user_id)
@@ -4360,23 +4488,23 @@ for event in longpoll.listen():
                     if message_text in ['вр','вз']:
                         charthp = load_main_character(user_id)['temp_hit_points']
                         send_message(f"У вас {charthp} временных ПЗ.")
-                continue
+                return
             elif message_text[0:3] in dnd5e_data.code_fast_value: #трехбуквенные коды, ттг
                 if len(message_text)>3:
                     parts = message_text.split(' ')
                     if len(parts) > 2:
                         send_message("Неверный формат бонуса.")
-                        continue
+                        return
                     if len(parts) <1:
                         send_message("Неверный формат бонуса.")
-                        continue
+                        return
                     try:
                         code = parts[0]
                         value = parts[1]
                         value = int(value)
                     except ValueError:
                         send_message("Пожалуйста, введите правильный номер заклинания для получения ссылки.")
-                        continue
+                        return
                     if code in ['ttg','ттг']:
                         char = load_main_character(user_id)
                         spells = char['known_spells']
@@ -4391,21 +4519,21 @@ for event in longpoll.listen():
                                     break
                         else:
                             send_message("Заклинания под таким номером не существует.")
-                        continue
-                continue
+                        return
+                return
         except ValueError:
             send_message("Персонаж не подключен. Создайте персонажа, чтобы использовать эту функцию.")
-            continue
+            return
         except KeyError:
             send_message("Персонаж не подключен. Создайте персонажа, чтобы использовать эту функцию.")
-            continue
+            return
         except IndexError:
             send_message("Персонаж не подключен. Создайте персонажа, чтобы использовать эту функцию.")
-            continue
+            return
 
         if message_text in ['закрыть клавиатуру','закрклав','-клав','-кл','зкл']:
             send_message("Клавиатура закрыта.")
-            continue
+            return
 
         elif chat_id == None:
             if  message_text == "создать персонажа" or message_text == "создать":
@@ -4432,6 +4560,79 @@ for event in longpoll.listen():
                 send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
 
         # Обработка команд, доступных в личке бота
-        
 
-         
+
+def init_vk():
+    global vk_session, longpoll, vk, vk_upload
+    if not TOKEN:
+        raise RuntimeError('VK_TOKEN is not set')
+    vk_session = vk_api.VkApi(token=TOKEN)
+    longpoll = VkBotLongPoll(vk_session, int(GROUP_ID))
+    vk = vk_session.get_api()
+    vk_upload = VkUpload(vk_session)
+
+
+def run_vk_bot():
+    global current_platform
+    init_vk()
+    print('VK bot started')
+    for vk_event in longpoll.listen():
+        with transport_lock:
+            current_platform = 'vk'
+            handle_bot_event(vk_event)
+
+
+def run_telegram_bot():
+    global current_platform, telegram_chat_id, telegram_message_id
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError('TELEGRAM_BOT_TOKEN is not set')
+    offset = None
+    print('Telegram bot started')
+    while True:
+        params = {'timeout': 30}
+        if offset is not None:
+            params['offset'] = offset
+        try:
+            updates = telegram_api('getUpdates', **params)
+            for update in updates:
+                offset = update['update_id'] + 1
+                message = update.get('message') or update.get('edited_message')
+                if not message:
+                    continue
+                text = message.get('text') or message.get('caption') or ''
+                chat = message.get('chat') or {}
+                is_private = chat.get('type') == 'private'
+                mentioned = TELEGRAM_BOT_USERNAME and f'@{TELEGRAM_BOT_USERNAME}' in text.lower()
+                if not is_private and not (text.startswith(symbol) or mentioned):
+                    continue
+                with transport_lock:
+                    current_platform = 'telegram'
+                    telegram_chat_id = chat.get('id')
+                    telegram_message_id = message.get('message_id')
+                    handle_bot_event(_TelegramEvent(update))
+        except Exception as exc:
+            print('Telegram polling error:', exc)
+            time.sleep(5)
+
+
+def run_selected_bots():
+    platforms = {part.strip() for part in BOT_PLATFORM.replace('+', ',').split(',') if part.strip()}
+    if not platforms:
+        platforms = {'vk'}
+    threads = []
+    if 'vk' in platforms or 'both' in platforms:
+        thread = threading.Thread(target=run_vk_bot, daemon=False)
+        thread.start()
+        threads.append(thread)
+    if 'telegram' in platforms or 'tg' in platforms or 'both' in platforms:
+        thread = threading.Thread(target=run_telegram_bot, daemon=False)
+        thread.start()
+        threads.append(thread)
+    if not threads:
+        raise RuntimeError(f'Unknown BOT_PLATFORM: {BOT_PLATFORM}')
+    for thread in threads:
+        thread.join()
+
+
+if __name__ == '__main__':
+    run_selected_bots()

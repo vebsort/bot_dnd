@@ -1,0 +1,7 @@
+{
+  "BOT_PLATFORM": "telegram",
+  "TELEGRAM_BOT_TOKEN": "token_from_BotFather",
+  "TELEGRAM_BOT_USERNAME": "bot_username_without_at",
+  "VK_TOKEN": "vk_group_token",
+  "VK_GROUP_ID": "179538565"
+}
