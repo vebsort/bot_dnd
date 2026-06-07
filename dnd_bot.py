@@ -53,6 +53,8 @@ transport_lock = threading.RLock()
 
 # Состояния пользователей (для простой машины состояний)
 user_states = {}
+# Ожидание выбора результата поиска по dnd5e.club (отдельно от user_states)
+dnd5e_search_states = {}
 user_warnings = {}
 # Последний бросок по user_id для переброса вдохновением (-вдох)
 last_roll_by_user = {}
@@ -149,13 +151,19 @@ def download_character_photo(photo_attachment, image_url=None, vk_api_obj=None):
 
 
 #функция отправки сообщения (в зависимости от лички/беседы меняет параметры)
-def send_message(message, keyboard=None, attachment=None, remove_keyboard=False):
+def send_message(message, keyboard=None, attachment=None, remove_keyboard=False, inline_keyboard=None):
     """Отправляет сообщение пользователю. attachment — строка вложения VK (например, photo123_456)."""
     if current_platform == 'telegram':
-        send_telegram_message(message, keyboard=keyboard, attachment=attachment, remove_keyboard=remove_keyboard)
+        send_telegram_message(
+            message,
+            keyboard=keyboard,
+            attachment=attachment,
+            remove_keyboard=remove_keyboard,
+            inline_keyboard=inline_keyboard,
+        )
         return
 
-    if event.chat_id != None:
+    if chat_id is not None:
         params = {
             'chat_id': message_id,
             'message': message,
@@ -167,8 +175,9 @@ def send_message(message, keyboard=None, attachment=None, remove_keyboard=False)
             'message': message,
             'random_id': random.randint(1, 10000)
          }
-    if keyboard:
-        params['keyboard'] = json.dumps(keyboard)
+    vk_keyboard = inline_keyboard if inline_keyboard is not None else keyboard
+    if vk_keyboard:
+        params['keyboard'] = json.dumps(vk_keyboard)
     if attachment:
         params['attachment'] = attachment
 
@@ -209,9 +218,11 @@ def vk_keyboard_to_telegram_markup(keyboard):
     }
 
 
-def send_telegram_message(message, keyboard=None, attachment=None, remove_keyboard=False):
+def send_telegram_message(message, keyboard=None, attachment=None, remove_keyboard=False, inline_keyboard=None):
     global telegram_last_reply_markup_by_chat
-    if remove_keyboard:
+    if inline_keyboard is not None:
+        reply_markup = inline_keyboard
+    elif remove_keyboard:
         reply_markup = {'remove_keyboard': True}
         telegram_last_reply_markup_by_chat.pop(telegram_chat_id, None)
     elif keyboard is not None:
@@ -240,7 +251,7 @@ def send_telegram_message(message, keyboard=None, attachment=None, remove_keyboa
             response.raise_for_status()
         return
 
-    telegram_api('sendMessage', **params)
+    return telegram_api('sendMessage', **params)
 
 
 def get_telegram_file_url(file_id):
@@ -1216,8 +1227,279 @@ def get_dndsort_spell_link(spellname):
     """Обратная совместимость: ссылка на заклинание на dnd5e.club."""
     return get_dnd5e_spell_link(spellname)
 
-    
-    
+
+DND5E_CLUB_BASE_URL = "https://dnd5e.club"
+DND5E_HANDBOOK_CACHE_TTL = 3600
+_dnd5e_handbook_cache = None
+_dnd5e_handbook_cache_time = 0
+
+DND5E_HANDBOOK_INDEX_QUERY = """
+query {
+  monsters { id title originalTitle alternativeTitles }
+  items { id title originalTitle alternativeTitles }
+  classes { id title originalTitle }
+  feats { id title originalTitle alternativeTitles }
+  features { id title originalTitle alternativeTitles }
+  glossaryItems { id title originalTitle alternativeTitles }
+  species { id title originalTitle }
+  origins { id title originalTitle alternativeTitles }
+  spells { id title originalTitle alternativeTitles }
+}
+"""
+
+# graphql_key -> (url_path, русское название раздела)
+DND5E_HANDBOOK_CATEGORIES = (
+    ('spells', 'spells', 'Заклинание'),
+    ('monsters', 'monsters', 'Чудовище'),
+    ('items', 'items', 'Предмет'),
+    ('classes', 'classes', 'Класс'),
+    ('feats', 'feats', 'Черта'),
+    ('features', 'feats', 'Особенность'),
+    ('species', 'specie', 'Вид'),
+    ('origins', 'feats', 'Предыстория'),
+    ('glossaryItems', 'glossary', 'Глоссарий'),
+)
+
+
+def _normalize_search_text(text):
+    if not text:
+        return ''
+    text = str(text).lower().replace('ё', 'е')
+    text = re.sub(r'[^a-zа-я0-9\s\-]', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _item_search_blob(item):
+    parts = [
+        item.get('title', ''),
+        item.get('originalTitle', ''),
+        item.get('id', '').replace('-', ' '),
+    ]
+    alts = item.get('alternativeTitles') or []
+    if isinstance(alts, list):
+        parts.extend(alts)
+    return _normalize_search_text(' '.join(p for p in parts if p))
+
+
+def _score_handbook_item(item, query_norm, query_tokens):
+    blob = _item_search_blob(item)
+    if not blob or not query_norm:
+        return 0
+    title_norm = _normalize_search_text(item.get('title', ''))
+    orig_norm = _normalize_search_text(item.get('originalTitle', ''))
+    id_norm = _normalize_search_text(item.get('id', '').replace('-', ' '))
+    score = 0
+    if query_norm in (title_norm, orig_norm, id_norm):
+        score = 100
+    elif title_norm.startswith(query_norm) or orig_norm.startswith(query_norm):
+        score = max(score, 85)
+    elif id_norm.replace(' ', '-') == query_norm.replace(' ', '-'):
+        score = max(score, 80)
+    elif query_norm in title_norm or query_norm in orig_norm or query_norm in blob:
+        score = max(score, 70)
+    if query_tokens and all(t in blob for t in query_tokens):
+        score = max(score, 55)
+    for token in query_tokens:
+        if token in title_norm:
+            score += 25
+        elif token in orig_norm:
+            score += 20
+        elif token in id_norm:
+            score += 15
+        elif token in blob:
+            score += 8
+    return score
+
+
+def get_dnd5e_handbook_index():
+    global _dnd5e_handbook_cache, _dnd5e_handbook_cache_time
+    now = time.time()
+    if _dnd5e_handbook_cache is not None and now - _dnd5e_handbook_cache_time < DND5E_HANDBOOK_CACHE_TTL:
+        return _dnd5e_handbook_cache
+    try:
+        resp = requests.post(
+            f'{DND5E_CLUB_BASE_URL}/graphql',
+            json={'query': DND5E_HANDBOOK_INDEX_QUERY},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json().get('data') or {}
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return _dnd5e_handbook_cache or []
+    index = []
+    for graphql_key, url_path, type_label in DND5E_HANDBOOK_CATEGORIES:
+        for item in data.get(graphql_key) or []:
+            if not item.get('id'):
+                continue
+            index.append({
+                'id': item['id'],
+                'title': item.get('title') or item['id'],
+                'originalTitle': item.get('originalTitle') or '',
+                'alternativeTitles': item.get('alternativeTitles') or [],
+                'url_path': url_path,
+                'type_label': type_label,
+            })
+    _dnd5e_handbook_cache = index
+    _dnd5e_handbook_cache_time = now
+    return index
+
+
+def dnd5e_handbook_item_url(item):
+    return f"{DND5E_CLUB_BASE_URL}/{item['url_path']}/{item['id']}"
+
+
+def make_dnd5e_search_inline_keyboard(result_count):
+    """Inline-клавиатура 1–N и «Назад» — привязана к сообщению с результатами поиска."""
+    number_row = []
+    for i in range(1, result_count + 1):
+        number_row.append({
+            'action': {
+                'type': 'callback',
+                'label': str(i),
+                'payload': json.dumps({'d5search': i}, ensure_ascii=False),
+            },
+            'color': 'primary',
+        })
+    return {
+        'inline': True,
+        'buttons': [
+            number_row,
+            [{
+                'action': {
+                    'type': 'callback',
+                    'label': 'Назад',
+                    'payload': json.dumps({'d5search': 0}, ensure_ascii=False),
+                },
+                'color': 'secondary',
+            }],
+        ],
+    }
+
+
+def dnd5e_search_inline_keyboard_for_telegram(result_count):
+    return {
+        'inline_keyboard': [
+            [{'text': str(i), 'callback_data': f'd5s:{i}'} for i in range(1, result_count + 1)],
+            [{'text': 'Назад', 'callback_data': 'd5s:0'}],
+        ],
+    }
+
+
+def clear_dnd5e_search_inline_keyboard(user_id):
+    state = dnd5e_search_states.get(user_id)
+    if not state or current_platform != 'telegram':
+        return
+    msg_id = state.get('telegram_message_id')
+    if msg_id and telegram_chat_id is not None:
+        try:
+            telegram_api(
+                'editMessageReplyMarkup',
+                chat_id=telegram_chat_id,
+                message_id=msg_id,
+                reply_markup={'inline_keyboard': []},
+            )
+        except Exception as exc:
+            print('clear_dnd5e_search_inline_keyboard:', exc)
+
+
+def apply_dnd5e_search_selection(user_id, num):
+    """num: 1–5 — результат, 0 — отмена."""
+    state = dnd5e_search_states.get(user_id)
+    if not state:
+        return False
+    results = state.get('results', [])
+    if num == 0:
+        clear_dnd5e_search_inline_keyboard(user_id)
+        dnd5e_search_states.pop(user_id, None)
+        send_message('Поиск отменён.', keyboards.main_keyboard)
+        return True
+    if 1 <= num <= len(results):
+        clear_dnd5e_search_inline_keyboard(user_id)
+        dnd5e_search_states.pop(user_id, None)
+        r = results[num - 1]
+        send_message(f"[{r['type_label']}] {r['title']}\n{r['url']}", keyboards.main_keyboard)
+        return True
+    return False
+
+
+def search_dnd5e_handbook(query, limit=5):
+    query_norm = _normalize_search_text(query)
+    if not query_norm:
+        return []
+    query_tokens = [t for t in query_norm.split() if t]
+    scored = []
+    for item in get_dnd5e_handbook_index():
+        score = _score_handbook_item(item, query_norm, query_tokens)
+        if score > 0:
+            scored.append((score, item))
+    scored.sort(key=lambda x: (-x[0], x[1]['title']))
+    results = []
+    for _, item in scored[:limit]:
+        results.append({
+            'title': item['title'],
+            'type_label': item['type_label'],
+            'url': dnd5e_handbook_item_url(item),
+        })
+    return results
+
+
+def start_dnd5e_handbook_search(user_id, query):
+    dnd5e_search_states.pop(user_id, None)
+    try:
+        results = search_dnd5e_handbook(query, limit=5)
+    except Exception as e:
+        print('search_dnd5e_handbook error:', e)
+        send_message('Не удалось выполнить поиск на dnd5e.club. Попробуйте позже.')
+        return
+    if not results:
+        send_message(f'По запросу «{query}» ничего не найдено в справочнике dnd5e.club.')
+        return
+    lines = [f'Поиск: «{query}»', '']
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. [{r['type_label']}] {r['title']}")
+    lines.append('\nВыберите номер кнопкой под сообщением:')
+    inline_kb = (
+        dnd5e_search_inline_keyboard_for_telegram(len(results))
+        if current_platform == 'telegram'
+        else make_dnd5e_search_inline_keyboard(len(results))
+    )
+    sent = send_message('\n'.join(lines), inline_keyboard=inline_kb)
+    search_state = {'results': results}
+    if current_platform == 'telegram' and isinstance(sent, dict):
+        search_state['telegram_message_id'] = sent.get('message_id')
+    dnd5e_search_states[user_id] = search_state
+
+
+def handle_dnd5e_search_selection(user_id, msg_stripped):
+    state = dnd5e_search_states.get(user_id)
+    if not state:
+        return False
+    if msg_stripped.startswith('поиск '):
+        clear_dnd5e_search_inline_keyboard(user_id)
+        dnd5e_search_states.pop(user_id, None)
+        return False
+    if msg_stripped == 'поиск':
+        clear_dnd5e_search_inline_keyboard(user_id)
+        dnd5e_search_states.pop(user_id, None)
+        return False
+    results = state.get('results', [])
+    if msg_stripped == 'назад':
+        apply_dnd5e_search_selection(user_id, 0)
+        return True
+    if msg_stripped.isdigit():
+        num = int(msg_stripped)
+        if 1 <= num <= len(results):
+            apply_dnd5e_search_selection(user_id, num)
+            return True
+        send_message(f'Нажмите кнопку от 1 до {len(results)} под сообщением или «Назад».')
+        return True
+    send_message(f'Нажмите кнопку от 1 до {len(results)} под сообщением или «Назад».')
+    return True
+
+
+def handle_dnd5e_search_callback(user_id, num):
+    return apply_dnd5e_search_selection(user_id, num)
+
 
 def show_all_spells(character, show_keyboard=True, ttg_msg=True):
     spell_list = character['known_spells']
@@ -3465,6 +3747,12 @@ HELP_TOPICS = {
         "Пример: справка огненный шар или спр fireball → ссылка на dnd5e.club\n"
         "По номеру заклинания: спр закл N — ссылка на N-е заклинание из вашего списка (например: спр закл 1)."
     )),
+    'поиск': ('Поиск по справочнику dnd5e.club', (
+        "Поиск по всему справочнику: поиск <запрос>.\n"
+        "Пример: поиск дракон или поиск fireball.\n"
+        "Бот покажет до 5 результатов (заклинания, чудовища, предметы, классы, черты и др.) "
+        "и кнопки 1–5 под сообщением для выбора ссылки на dnd5e.club."
+    )),
     'кубики': ('Броски кубиков XdY и по характеристикам', (
         "• Формула XdY: 2d6, d20, 10d100. С модификатором: 3d20+4.\n"
         "• Несколько модификаторов суммируются: 3d20+4+8 = 3d20+12.\n"
@@ -3517,7 +3805,7 @@ def show_help(message_id, topic=None):
         send_message("\n".join(lines), keyboards.main_keyboard)
     except Exception as e:
         print("show_help error:", e)
-        send_message("Список команд: Создать персонажа, Мои персонажи, Редакция (2014/2024), Помощь, Напарник (нап), Справка (справ/dnd/спр), Кубики XdY и по навыкам, Инициатива (ини). Напишите «помощь команда» для подробностей.")
+        send_message("Список команд: Создать персонажа, Мои персонажи, Редакция (2014/2024), Помощь, Напарник (нап), Поиск (поиск), Справка (справ/dnd/спр), Кубики XdY и по навыкам, Инициатива (ини). Напишите «помощь команда» для подробностей.")
 
 # Основной цикл бота
 class _TelegramObject:
@@ -3551,6 +3839,34 @@ class _TelegramEvent:
 def handle_bot_event(incoming_event):
     global event, chat_id, user_id, message_id
     event = incoming_event
+
+    if event.type == VkBotEventType.MESSAGE_EVENT:
+        obj = event.object
+        user_id = obj['user_id']
+        peer_id = obj['peer_id']
+        if peer_id != user_id:
+            chat_id = peer_id
+            message_id = peer_id
+        else:
+            chat_id = None
+            message_id = user_id
+        try:
+            payload = json.loads(obj.get('payload') or '{}')
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if 'd5search' in payload:
+            if vk:
+                try:
+                    vk.messages.sendMessageEventAnswer(
+                        event_id=obj['event_id'],
+                        user_id=user_id,
+                        peer_id=peer_id,
+                    )
+                except Exception as exc:
+                    print('sendMessageEventAnswer:', exc)
+            handle_dnd5e_search_callback(user_id, int(payload['d5search']))
+        return
+
     if event.type == VkBotEventType.MESSAGE_NEW:
         chat_id = event.chat_id
         user_id = event.obj.message['from_id']
@@ -3619,6 +3935,27 @@ def handle_bot_event(incoming_event):
             send_message("Использование: справка <запрос>\nНапример: справка огненный шар или спр fireball\nИли: спр закл 1 — ссылка на заклинание по номеру в списке.")
             dnd_ref_handled = True
         if dnd_ref_handled:
+            return
+
+        # Поиск по справочнику dnd5e.club: выбор результата 1–5
+        if user_id in dnd5e_search_states:
+            if handle_dnd5e_search_selection(user_id, msg_stripped):
+                return
+
+        # Поиск по справочнику dnd5e.club
+        if msg_stripped.startswith('поиск '):
+            query = original_message_text.strip()[len('поиск '):].strip()
+            if query:
+                start_dnd5e_handbook_search(user_id, query)
+            else:
+                send_message("Укажите запрос после команды, например: поиск дракон")
+            return
+        if msg_stripped == 'поиск':
+            send_message(
+                "Использование: поиск <запрос>\n"
+                "Например: поиск дракон или поиск fireball\n"
+                "Покажет до 5 результатов — нажмите кнопку 1–5 под сообщением."
+            )
             return
 
         # --- Напарники: список, добавление и просмотр ---
@@ -4607,7 +4944,7 @@ def run_vk_bot():
 
 
 def run_telegram_bot():
-    global current_platform, telegram_chat_id, telegram_message_id
+    global current_platform, telegram_chat_id, telegram_message_id, chat_id, user_id, message_id
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError('TELEGRAM_BOT_TOKEN is not set')
     try:
@@ -4625,6 +4962,30 @@ def run_telegram_bot():
             updates = telegram_api('getUpdates', **params)
             for update in updates:
                 offset = update['update_id'] + 1
+                callback_query = update.get('callback_query')
+                if callback_query:
+                    data = callback_query.get('data') or ''
+                    if data.startswith('d5s:'):
+                        try:
+                            num = int(data.split(':', 1)[1])
+                        except ValueError:
+                            continue
+                        from_user = callback_query.get('from') or {}
+                        msg = callback_query.get('message') or {}
+                        chat = msg.get('chat') or {}
+                        with transport_lock:
+                            current_platform = 'telegram'
+                            telegram_chat_id = chat.get('id')
+                            telegram_message_id = msg.get('message_id')
+                            user_id = from_user.get('id')
+                            chat_id = None if chat.get('type') == 'private' else chat.get('id')
+                            message_id = telegram_chat_id if chat_id else user_id
+                            try:
+                                telegram_api('answerCallbackQuery', callback_query_id=callback_query['id'])
+                            except Exception as exc:
+                                print('answerCallbackQuery:', exc)
+                            handle_dnd5e_search_callback(user_id, num)
+                    continue
                 message = update.get('message') or update.get('edited_message')
                 if not message:
                     continue
