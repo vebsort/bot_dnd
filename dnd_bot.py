@@ -101,6 +101,8 @@ def get_photo_url_from_attachments(attachments):
 
 def download_character_photo(photo_attachment, image_url=None, vk_api_obj=None):
     """Скачивает фото во временный файл. Сначала пробует image_url (URL, сохранённый при загрузке), иначе — VK API photos.getById. Возвращает путь к файлу или None."""
+    if photo_attachment and photo_attachment.startswith('url:'):
+        image_url = image_url or photo_attachment[4:]
     if image_url:
         try:
             r = requests.get(image_url, timeout=10)
@@ -146,6 +148,17 @@ def download_character_photo(photo_attachment, image_url=None, vk_api_obj=None):
         return path
     except Exception:
         return None
+
+
+def character_image_for_send(character):
+    """Attachment для send_message: локальный файл в Telegram, VK photo id в VK. Возвращает (attachment, temp_path)."""
+    attachment = character.get('image') or None
+    if not attachment:
+        return None, None
+    if current_platform == 'telegram':
+        path = download_character_photo(attachment, image_url=character.get('image_url'))
+        return path, path
+    return attachment, None
 
 
 #функция отправки сообщения (в зависимости от лички/беседы меняет параметры)
@@ -605,9 +618,9 @@ RESERVED_NICKNAMES = frozenset(dnd5e_data.code_word_list + [
 ])
 COMPANION_STAT_SUFFIXES = ('ини', 'пз', 'макс', 'мпз', 'кб', 'атак', 'атк', 'уров', 'ур', 'уровень',
     'лов', 'сил', 'вын', 'инт', 'муд', 'хар', 'акр', 'атл', 'вни', 'выж', 'дре', 'зап',
-    'ист', 'лрк', 'лр', 'маг', 'мед', 'обм', 'при', 'про', 'рас', 'рел', 'скр', 'убе')
-# Ловкость рук: оба варианта (лр, лрк) хранятся под ключом 'лр'
-COMPANION_SKILL_STORAGE_KEY = lambda suf: 'лр' if suf in ('лр', 'лрк') else suf
+    'ист', 'лрк', 'ловрук', 'маг', 'мед', 'обм', 'при', 'про', 'рас', 'рел', 'скр', 'убе')
+# Ловкость рук: лрк и ловрук хранятся под ключом 'лр'
+COMPANION_SKILL_STORAGE_KEY = lambda suf: 'лр' if suf in ('лрк', 'ловрук') else suf
 # Испытания напарника: [кличка] исп <характеристика> (раздельные слова)
 # Поддерживаем сокращения и полные слова; храним модификаторы в канонических ключах.
 COMPANION_TRIAL_CODE_MAP = {
@@ -636,7 +649,7 @@ COMPANION_SKILL_DISPLAY = {
     'вни': 'Внимание', 'внимание': 'Внимание', 'выж': 'Выживание', 'выживание': 'Выживание',
     'дре': 'Дрессировка', 'дрессировка': 'Дрессировка', 'зап': 'Запугивание', 'запугивание': 'Запугивание',
     'исп': 'Исполнение', 'исполнение': 'Исполнение', 'ист': 'История', 'история': 'История',
-    'лр': 'Ловкость рук', 'лрк': 'Ловкость рук', 'ловкость рук': 'Ловкость рук', 'маг': 'Магия', 'магия': 'Магия',
+    'лрк': 'Ловкость рук', 'ловрук': 'Ловкость рук', 'ловкость рук': 'Ловкость рук', 'маг': 'Магия', 'магия': 'Магия',
     'мед': 'Медицина', 'медицина': 'Медицина', 'обм': 'Обман', 'обман': 'Обман',
     'при': 'Природа', 'природа': 'Природа', 'про': 'Проницательность', 'проницательность': 'Проницательность',
     'рас': 'Расследование', 'расследование': 'Расследование', 'рел': 'Религия', 'религия': 'Религия',
@@ -650,7 +663,7 @@ COMPANION_CHECK_NAMES = {
     'хар': 'Проверка Харизмы', 'харизма': 'Проверка Харизмы',
     'акр': 'Проверка Ловкости (Акробатика)', 'атл': 'Проверка Силы (Атлетика)', 'вни': 'Проверка Мудрости (Внимание)',
     'выж': 'Проверка Мудрости (Выживание)', 'дре': 'Проверка Мудрости (Дрессировка)', 'зап': 'Проверка Харизмы (Запугивание)',
-    'исп': 'Проверка Харизмы (Исполнение)', 'ист': 'Проверка Истории (Интеллект)', 'лр': 'Проверка Ловкости (Ловкость рук)', 'лрк': 'Проверка Ловкости (Ловкость рук)',
+    'исп': 'Проверка Харизмы (Исполнение)', 'ист': 'Проверка Истории (Интеллект)', 'лрк': 'Проверка Ловкости (Ловкость рук)', 'ловрук': 'Проверка Ловкости (Ловкость рук)',
     'маг': 'Проверка Интеллекта (Магия)', 'мед': 'Проверка Мудрости (Медицина)', 'обм': 'Проверка Харизмы (Обман)',
     'при': 'Проверка Интеллекта (Природа)', 'про': 'Проверка Мудрости (Проницательность)', 'рас': 'Проверка Интеллекта (Расследование)',
     'рел': 'Проверка Интеллекта (Религия)', 'скр': 'Проверка Ловкости (Скрытность)', 'убе': 'Проверка Харизмы (Убеждение)',
@@ -789,7 +802,34 @@ def stat_format(stat):
         stat_str = f"{stat}" + f" ({stat_mod})"
     return stat_str
 
-def get_prof_string(character, profkey = 'prof_mult_dict', is_saving_throw = False, horizontal_format = False, show_all = False):
+STAT_ABBR = ['СИЛ', 'ЛОВ', 'ВЫН', 'ИНТ', 'МДР', 'ХАР']
+STAT_KEYS = ['strength', 'dexterity', 'constitution', 'intelligence', 'wisdom', 'charisma']
+ABILITY_ABBR = {
+    'Сила': 'СИЛ', 'Ловкость': 'ЛОВ', 'Выносливость': 'ВЫН',
+    'Интеллект': 'ИНТ', 'Мудрость': 'МДР', 'Харизма': 'ХАР',
+}
+
+def stat_compact(stat):
+    mod = dnd5e_data.calc_mod(stat)
+    if mod >= 0:
+        return f"{stat}(+{mod})"
+    return f"{stat}({mod})"
+
+def format_gp_total(money_dict):
+    gp = money_sum(money_dict)
+    if gp == int(gp):
+        return f"{int(gp)} зм"
+    return f"{gp} зм"
+
+def skill_label(skill_name, show_commands=False):
+    if not show_commands:
+        return skill_name
+    aliases = dnd5e_data.skill_command_aliases.get(skill_name)
+    if aliases:
+        return f"{skill_name} ({', '.join(aliases)})"
+    return skill_name
+
+def get_prof_string(character, profkey = 'prof_mult_dict', is_saving_throw = False, horizontal_format = False, show_all = False, show_commands = False):
     keys_list = list(character[profkey].keys())
     text = ''
     if show_all == True: # определяет, будет ли показываться все или только навыки с умением (или экспертизой)
@@ -803,10 +843,11 @@ def get_prof_string(character, profkey = 'prof_mult_dict', is_saving_throw = Fal
                 mod = get_mod(f'{i.lower()}', character) + character['prof_saves_dict'][f'{i}'] * character['proficiency_bonus']
             else:
                 mod = get_mod(f'{i.lower()}', character)
+            label = skill_label(i, show_commands=show_commands and not is_saving_throw)
             if mod >= 0:
-                text += f'{i} +{mod}, '
+                text += f'{label} +{mod}, '
             else:
-                text += f'{i} {mod}, '
+                text += f'{label} {mod}, '
         if horizontal_format == True:
             text = text[:-2] + "\n"
     if horizontal_format == False:
@@ -814,7 +855,7 @@ def get_prof_string(character, profkey = 'prof_mult_dict', is_saving_throw = Fal
     return text
 
 def show_all_skills(character, horizontal_format=True, show_all=True):
-    message = get_prof_string(character, horizontal_format=True, show_all=True)
+    message = get_prof_string(character, horizontal_format=True, show_all=True, show_commands=True)
     send_message(message)
 
 def show_spell_slots(character, horizontal_format=True, show_all=True):
@@ -1709,7 +1750,7 @@ def get_mod(skill_name, character, get_name = False):
     elif skill_name in ['ист','история']:
         mod = dnd5e_data.calc_mod(character['stats']['intelligence']) + character['prof_mult_dict']['История'] * character['proficiency_bonus']
         name = 'Проверка Истории (Интеллект)'
-    elif skill_name in ['лр','ловрук','лврк','лвкрук','ловкрук','рук','лрук','лрк','ловкость рук']:
+    elif skill_name in ['ловрук', 'лрк', 'ловкость рук']:
         mod = dnd5e_data.calc_mod(character['stats']['dexterity']) + character['prof_mult_dict']['Ловкость рук'] * character['proficiency_bonus']
         name = 'Проверка Ловкости (Ловкость рук)'
     elif skill_name in ['маг','магия']:
@@ -1922,63 +1963,42 @@ def get_spell_stat(character):
         return dnd5e_data.class_spell_stat[f'{classs}']
 
 def char_sheet_message(character): #
-    if character['inspiration']:
-        inspiration = '✨' 
-    else:
-        inspiration = 'нет'
+    header = f"{character['name']} · {character['subrace']} {character['class']} {character['level']}"
+    if not character.get('milestone'):
+        header += f" · {character['xp']} XP"
 
-    if character['initiative'] >= 0:
-        initiative = f"+{character['initiative']}"
-    else:
-        initiative = f"{character['initiative']}"
+    inspiration = '✨' if character['inspiration'] else 'нет'
+    line_meta = f"БМ +{character['proficiency_bonus']} · {inspiration} · {format_gp_total(character['money'])}"
 
-    if character['milestone']:
-        xp_str = '\n'
-    else:
-        xp_str = f"Опыт: {character['xp']}\n\n"
+    hp_line = f"❤️ {character['hit_points']}/{character['max_hit_points']}"
+    if character['temp_hit_points']:
+        hp_line += f" (+{character['temp_hit_points']})"
+    hp_line += f" · КЗ {character['hit_dice_count']}/{character['hit_dice_max']}"
 
-    race_or_species = "Вид" if character.get('edition') == '2024' else "Раса"
-    stats_msg = (
-    f"Имя: {character['name']}\n"
-    f"{race_or_species}: {character['subrace']}\n"
-    f"Класс: {character['class']}\n"
-    f"Уровень: {character['level']}\n"
-    f"{xp_str}"
+    initiative = f"+{character['initiative']}" if character['initiative'] >= 0 else str(character['initiative'])
+    combat_line = f"🛡️ {character['armor_class']} · ⚡ {initiative} · {character['speed']} фт"
 
-    f"Вдохновение: {inspiration}\n"
-    f"Бонус умения: +{character['proficiency_bonus']}\n\n"
+    lines = [header, line_meta, '', hp_line, combat_line]
 
-    f"❤️ ПЗ: {character['hit_points']}\n"
-    f"(временные: {character['temp_hit_points']})\n"
-    f"Макс. ПЗ: {character['max_hit_points']}\n\n"
+    spell_stat = get_spell_stat(character)
+    if spell_stat:
+        spell_mod = get_mod(spell_stat.lower(), character) + character['proficiency_bonus']
+        atk_str = f"+{spell_mod}" if spell_mod >= 0 else str(spell_mod)
+        spell_dc = 8 + get_mod(spell_stat.lower(), character) + character['proficiency_bonus']
+        stat_abbr = ABILITY_ABBR.get(spell_stat, spell_stat[:3].upper())
+        lines += ['', f"🔮 {stat_abbr} · атк {atk_str} · СЛ {spell_dc}"]
 
-    f"КЗ: {character['hit_dice_count']} из {character['hit_dice_max']}\n\n"
-    
-
-    f"🛡️ КБ: {character['armor_class']}\n"
-    f"Инициатива: {initiative}\n"
-    f"Скорость: {character['speed']} футов\n\n"
-
-    f"Монеты: {money_sum(character['money'])} зм\n\n"
-
-    f"---Заклинания---\n"
-    f"Характеристика: {get_spell_stat(character)}\n"
-    f"Бонус атаки: {get_mod(get_spell_stat(character).lower(),character) + character['proficiency_bonus']}\n"
-    f"CЛ испытаний: {8 + get_mod(get_spell_stat(character).lower(),character) + character['proficiency_bonus']}\n\n"
-
-    f"---Характеристики---\n"
-    f"Сила: {stat_format(character['stats']['strength'])}\n"
-    f"Ловкость: {stat_format(character['stats']['dexterity'])}\n"
-    f"Выносливость: {stat_format(character['stats']['constitution'])}\n"
-    f"Интеллект: {stat_format(character['stats']['intelligence'])}\n"
-    f"Мудрость: {stat_format(character['stats']['wisdom'])}\n"
-    f"Харизма: {stat_format(character['stats']['charisma'])}\n\n"
-
-    f"Испытания: {get_prof_string(character, 'prof_saves_dict', is_saving_throw=True)}\n"
-    f"Навыки: {get_prof_string(character, 'prof_mult_dict')}"
-
-    )
-    return stats_msg
+    stats = character['stats']
+    stat_vals = [stat_compact(stats[key]) for key in STAT_KEYS]
+    lines += [
+        '',
+        f"{STAT_ABBR[0]} {stat_vals[0]}  {STAT_ABBR[1]} {stat_vals[1]}  {STAT_ABBR[2]} {stat_vals[2]}",
+        f"{STAT_ABBR[3]} {stat_vals[3]}  {STAT_ABBR[4]} {stat_vals[4]}  {STAT_ABBR[5]} {stat_vals[5]}",
+        '',
+        f"Исп: {get_prof_string(character, 'prof_saves_dict', is_saving_throw=True)}",
+        f"Нав: {get_prof_string(character, 'prof_mult_dict')}",
+    ]
+    return '\n'.join(lines)
 
 #Генерация основных статических клавиатур
 
@@ -4549,7 +4569,14 @@ def handle_bot_event(incoming_event):
             elif message_text == 'я':
                 try:
                     char = load_main_character(user_id)
-                    send_message(char_sheet_message(char))
+                    message = char_sheet_message(char)
+                    attachment, temp_path = character_image_for_send(char)
+                    send_message(message, attachment=attachment)
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
                 except Exception:
                     send_message("Не удалось загрузить персонажа. Проверьте, что выбран основной персонаж.")
                 return
