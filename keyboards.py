@@ -228,6 +228,14 @@ char_edit_keyboard_not_main = {
                 "label": "Заклинания"
             },
             "color": "primary"
+        },
+        {
+            "action": {
+                "type": "text",
+                "payload": "{\"button\": \"1\"}",
+                "label": "Повышение"
+            },
+            "color": "positive"
         }],
         [{
             "action": {
@@ -298,6 +306,14 @@ char_edit_keyboard_main = {
                 "label": "Заклинания"
             },
             "color": "primary"
+        },
+        {
+            "action": {
+                "type": "text",
+                "payload": "{\"button\": \"1\"}",
+                "label": "Повышение"
+            },
+            "color": "positive"
         }],
         [{
             "action": {

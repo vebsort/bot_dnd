@@ -57,6 +57,45 @@ user_warnings = {}
 # Последний бросок по user_id для переброса вдохновением (-вдох)
 last_roll_by_user = {}
 
+LEVEL_UP_COMMANDS = frozenset({
+    'lvlup', 'лвлап', 'повышение', 'повыш', 'новый уровень', 'новур',
+})
+PRIVATE_MENU_COMMANDS = frozenset({
+    'создать персонажа', 'создать', 'мои персонажи', 'редакция',
+    'помощь', 'привет', 'начать', 'дом', 'домой', 'главная', 'начальный экран', 'начало',
+}) | LEVEL_UP_COMMANDS
+PRIVATE_USER_STATES = frozenset({'create_character', 'manage_character', 'choose_edition', 'hpincrease'})
+EQUIPMENT_CMD_PREFIXES = ('снаряжение', 'экипировка', 'снар', 'экип', 'сн')
+EQUIPMENT_SHOW_ALIASES = frozenset({'снар', 'снаряжение', 'сн', 'экип', 'экипировка'})
+EQUIPMENT_DELETE_WORDS = ('удалить', 'удал')
+EQUIPMENT_CLEAR_WORDS = ('очистить', 'очисть', 'очист')
+
+
+def is_group_chat():
+    return chat_id is not None
+
+
+def normalize_bot_command(text):
+    """Убирает упоминание бота и лишние пробелы."""
+    s = (text or '').strip()
+    s = s.replace(f'[club179538565|@ezgamednd] ', '')
+    if TELEGRAM_BOT_USERNAME:
+        s = re.sub(rf'@{re.escape(TELEGRAM_BOT_USERNAME)}\s*', '', s, flags=re.I)
+    if symbol in s:
+        s = s.replace(symbol, '')
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def private_chat_required(feature=None):
+    if not is_group_chat():
+        return True
+    if feature:
+        send_message(f"{feature} доступна только в личных сообщениях с ботом.")
+    else:
+        send_message("Эта команда доступна только в личных сообщениях с ботом.")
+    return False
+
 
 def get_photo_attachment(attachments):
     """Из вложений сообщения извлекает строку вложения фото для VK (photo{owner_id}_{id}_{access_key} или photo{owner_id}_{id}). Возвращает None, если фото нет."""
@@ -1049,6 +1088,150 @@ def delete_equipment_by_name_all(character, names):
     return deleted_count, not_found
 
 
+def _match_equipment_prefix(msg_lower):
+    for prefix in EQUIPMENT_CMD_PREFIXES:
+        if msg_lower == prefix:
+            return prefix, ''
+        if msg_lower.startswith(prefix + ' '):
+            return prefix, msg_lower[len(prefix) + 1:]
+    return None, None
+
+
+def _equipment_delete_rest(original_text, prefix):
+    return normalize_bot_command(original_text)[len(prefix):].strip()
+
+
+def _parse_simple_equipment_delete(rest):
+    """Парсит «-5 кинжал», «кинжал -5» или «-кинжал» для удаления через сн/снар."""
+    s = rest.strip()
+    if not s:
+        return None, None
+    if s.startswith('-'):
+        tail = s[1:].strip()
+        parts = tail.split()
+        if parts and parts[0].isdigit():
+            return ' '.join(parts[1:]).strip(), int(parts[0])
+        return tail, 1
+    parts = s.split()
+    if len(parts) >= 2 and parts[-1].startswith('-') and parts[-1][1:].isdigit():
+        return ' '.join(parts[:-1]).strip(), int(parts[-1][1:])
+    return None, None
+
+
+def _should_defer_sn_to_fast_delete(prefix, rest_lower):
+    """Команда «сн предмет -N» обрабатывается в code_fast_value, не здесь."""
+    if prefix != 'сн' or not rest_lower:
+        return False
+    if any(rest_lower == w or rest_lower.startswith(w + ' ') for w in EQUIPMENT_DELETE_WORDS + EQUIPMENT_CLEAR_WORDS):
+        return False
+    if rest_lower.startswith('-'):
+        return True
+    parts = rest_lower.split()
+    return len(parts) >= 2 and parts[-1].startswith('-') and parts[-1][1:].isdigit()
+
+
+def try_handle_equipment_command(original_text, user_id):
+    """Команды экипировки: снар / экип / сн / снаряжение / экипировка."""
+    msg_lower = normalize_bot_command(original_text).lower()
+    prefix, rest_lower = _match_equipment_prefix(msg_lower)
+    if prefix is None:
+        return False
+    if _should_defer_sn_to_fast_delete(prefix, rest_lower):
+        return False
+
+    rest_original = _equipment_delete_rest(original_text, prefix)
+
+    for word in EQUIPMENT_CLEAR_WORDS:
+        if rest_lower == word or rest_lower.startswith(word + ' '):
+            items_text = rest_original[len(word):].strip()
+            if not items_text:
+                send_message("Укажите название предмета, например: сн очистить зелье лечение", keyboard=keyboards.main_keyboard)
+                return True
+            try:
+                char = load_main_character(user_id)
+                characters = load_characters(user_id)
+                names = [s.strip() for s in items_text.split(',') if s.strip()]
+                deleted, not_found = delete_equipment_by_name_all(char, names)
+                replace_char(char, characters)
+                write_characters(user_id, characters)
+                msg = f"Удалено предметов: {deleted}."
+                if not_found:
+                    msg += "\n" + "\n".join(not_found)
+                send_message(msg, keyboard=keyboards.main_keyboard)
+                show_equipment(char, show_keyboard=False)
+            except Exception:
+                send_message("Ошибка при очистке. Формат: сн очистить название.", keyboard=keyboards.main_keyboard)
+            return True
+
+    for word in EQUIPMENT_DELETE_WORDS:
+        if rest_lower == word or rest_lower.startswith(word + ' '):
+            items_text = rest_original[len(word):].strip()
+            if not items_text:
+                send_message("Укажите предметы для удаления, например: снар удал 5 Кинжал, рубин (50 зм)", keyboard=keyboards.main_keyboard)
+                return True
+            try:
+                char = load_main_character(user_id)
+                characters = load_characters(user_id)
+                parsed_items = parse_equipment_bulk(items_text)
+                if not parsed_items:
+                    send_message("Не найдено ни одного предмета. Укажите что удалить: снар удал 5 Кинжал, рубин (50 зм)", keyboard=keyboards.main_keyboard)
+                else:
+                    deleted, errors = delete_equipment_bulk(char, parsed_items)
+                    replace_char(char, characters)
+                    write_characters(user_id, characters)
+                    msg = f"Удалено предметов: {deleted}."
+                    if errors:
+                        msg += "\n" + "\n".join(errors)
+                    send_message(msg, keyboard=keyboards.main_keyboard)
+                    show_equipment(char, show_keyboard=False)
+            except Exception:
+                send_message("Ошибка при удалении. Формат: снар удал название [кол-во] [стоимость].", keyboard=keyboards.main_keyboard)
+            return True
+
+    if rest_lower.startswith('-') or (rest_lower and _parse_simple_equipment_delete(rest_original)[0]):
+        name, amount = _parse_simple_equipment_delete(rest_original)
+        if name:
+            try:
+                char = load_main_character(user_id)
+                characters = load_characters(user_id)
+                check = create_item(char, name=name, amount=amount, delete=True)
+                if check == 1:
+                    replace_char(char, characters)
+                    write_characters(user_id, characters)
+                    send_message(f"Удалено из инвентаря: «{name}» × {amount}.", keyboard=keyboards.main_keyboard)
+                    show_equipment(char, show_keyboard=False)
+                elif check != -1:
+                    send_message("Не удалось удалить предмет.", keyboard=keyboards.main_keyboard)
+            except Exception:
+                send_message("Ошибка при удалении предмета.", keyboard=keyboards.main_keyboard)
+            return True
+
+    if not rest_lower:
+        try:
+            char = load_main_character(user_id)
+            show_equipment(char, show_keyboard=False)
+        except Exception:
+            send_message("Персонаж не подключен.", keyboard=keyboards.main_keyboard)
+        return True
+
+    try:
+        char = load_main_character(user_id)
+        characters = load_characters(user_id)
+        parsed_items = parse_equipment_bulk(rest_original)
+        if not parsed_items:
+            send_message("Не найдено ни одного предмета. Формат: 5 Кинжал, рубин (50 зм), ложка 1 фунт", keyboard=keyboards.main_keyboard)
+        else:
+            for it in parsed_items:
+                create_item(char, name=it['name'], amount=it['amount'], cost=it['cost'] if it.get('cost') else None, weight_str=it.get('weight_str', ''))
+            replace_char(char, characters)
+            write_characters(user_id, characters)
+            send_message('Предметы добавлены.')
+            show_equipment(char, show_keyboard=False)
+    except Exception:
+        send_message("Ошибка при добавлении. Проверьте формат: название [кол-во] [вес] [стоимость].", keyboard=keyboards.main_keyboard)
+    return True
+
+
 def create_item(character, name, desc='', amount=1, value=0, valuetype='зм', weight=0, itemtype='none', damage='none', damagetype='none', delete=False, cost=None, weight_str=''):
     """cost — опциональный dict вида {'зм': 50, 'пм': 14}. weight_str — строка вида '5 фунтов' или '2 унц'."""
     equipment_list = character['equipment']
@@ -1700,6 +1883,57 @@ def replace_char(character, characters):
         write_characters(user_id, characters)
     else:
         send_message('Ошибка. Обратитесь к админу')
+
+
+def level_up_hp_keyboard():
+    return keyboard_maker(array_to_text_color_array(["Да", "Нет", "Отмена"]), keyboard_columns=3, onetime=True)
+
+
+def start_level_up(user_id, character):
+    if not private_chat_required("Повышение уровня"):
+        return False
+    lvl = character['level']
+    if lvl >= 20:
+        send_message("Вы уже максимального уровня.")
+        return False
+    undo = {
+        'level': lvl,
+        'proficiency_bonus': character['proficiency_bonus'],
+        'hit_dice_max': character['hit_dice_max'],
+        'hit_dice_count': character['hit_dice_count'],
+    }
+    change_param(character, 'level', lvl + 1)
+    change_param(character, 'hit_dice_count', character['hit_dice_count'] + 1)
+    change_param(character, 'proficiency_bonus', dnd5e_data.proficiency_bonus(lvl + 1))
+    change_param(character, 'hit_dice_max', lvl + 1)
+    user_states[user_id] = {
+        'character': character,
+        'state': 'hpincrease',
+        'step': 1,
+        'level_up_undo': undo,
+    }
+    send_message(
+        f"Уровень повышен до {lvl + 1}. Изменить максимум ПЗ?",
+        level_up_hp_keyboard(),
+    )
+    return True
+
+
+def cancel_level_up(user_id):
+    state = user_states.get(user_id)
+    if not state or state.get('state') != 'hpincrease':
+        return False
+    char = state['character']
+    undo = state.get('level_up_undo')
+    if undo:
+        change_param(char, 'level', undo['level'])
+        change_param(char, 'proficiency_bonus', undo['proficiency_bonus'])
+        change_param(char, 'hit_dice_max', undo['hit_dice_max'])
+        change_param(char, 'hit_dice_count', undo['hit_dice_count'])
+    lvl = char['level']
+    del user_states[user_id]
+    send_message(f"Повышение уровня отменено. Уровень снова {lvl}.")
+    return True
 
 
 # игровые функции
@@ -2583,9 +2817,12 @@ def manage_character_flow(user_id, step, message_text, attachments=None, origina
         elif message_text == 'навыки':
             show_all_skills(state['character'])
 
-        elif message_text in ('снаряжение', 'экипировка'):
+        elif message_text in ('снаряжение', 'экипировка', 'экип', 'снар', 'сн'):
             state['step'] = 'equipment'
             show_equipment(state['character'])
+
+        elif message_text in LEVEL_UP_COMMANDS:
+            start_level_up(user_id, state['character'])
         
         elif message_text == 'особенности':
             check = show_features(state['character'], rewrite=True)
@@ -3801,19 +4038,24 @@ def handle_bot_event(incoming_event):
         else: message_id = user_id
 
         message_text = event.obj.message['text'] # Получение сообщения пользователя
-        if f'[club179538565|@ezgamednd] ' or f'{symbol}' in message_text: # Удаляем упоминание и слэш из текста сообщения
-            message_text = message_text.replace(f'[club179538565|@ezgamednd] ', '')
-            message_text = message_text.replace(f'{symbol}', '')
-        
-        original_message_text = message_text
-        message_text = message_text.lower() 
+        original_message_text = normalize_bot_command(message_text)
+        message_text = original_message_text.lower()
         
         print(f'{message_text}') #текст в терминал
+
+        msg_stripped = message_text.strip()
+        if is_group_chat():
+            if msg_stripped in PRIVATE_MENU_COMMANDS or msg_stripped.startswith('помощь '):
+                private_chat_required()
+                return
+            if user_id in user_states and user_states[user_id].get('state') in PRIVATE_USER_STATES:
+                private_chat_required("Управление персонажами")
+                del user_states[user_id]
+                return
 
         # Команда справки: ссылка на dnd5e.club (справка/справ/dnd/спр + текст запроса)
         # Специальный формат: спр закл N — ссылка на N-е заклинание из списка персонажа (dnd5e.club)
         dnd_ref_commands = ('справка ', 'справ ', 'dnd ', 'спр ')
-        msg_stripped = message_text.strip()
         dnd_ref_handled = False
         for cmd in dnd_ref_commands:
             if msg_stripped.startswith(cmd):
@@ -4034,6 +4276,9 @@ def handle_bot_event(incoming_event):
         if user_id in user_states:
             if user_states[user_id]['state'] == 'hpincrease':
                 state = user_states[user_id]
+                if message_text in ('отмена', 'отменить'):
+                    cancel_level_up(user_id)
+                    return
                 if state['step'] == 1:
                     if message_text == 'да':
                         hitdie = state['character']['hit_die']
@@ -4041,16 +4286,20 @@ def handle_bot_event(incoming_event):
                         sign_con = "+" if con_mod >=0 else ""
                         average = hitdie // 2 + 1
                         send_message(f"Ваша Кость здоровья — d{hitdie}. Вы можете кинуть ее и добавить ваш модификатор Выносливости ({sign_con}{con_mod}).\n\nВместо броска взять среднее значение: {average+con_mod}.\n\nТакже можете ввести насколько повысится ваш максимум ПЗ вручную, если бросаете кость вживую (максимум — {hitdie+con_mod})", keyboard_maker(array_to_text_color_array(
-                                        ["Кинуть","Среднее","Вручную"]),onetime=True))
+                                        ["Кинуть","Среднее","Вручную","Отмена"]),onetime=True))
                         state['step'] = 2
                         return
                     if message_text == 'нет':
                         exit_state(show_message=False)
+                        send_message(f"Уровень {state['character']['level']} сохранён без изменения максимума ПЗ.")
                         return
                     else:
-                        send_message(f"Выберите \"да\" или \"нет\".",keyboard=keyboard_maker(array_to_text_color_array(["Да","Нет"]),keyboard_columns=2,onetime=True))
+                        send_message(f"Выберите «Да», «Нет» или «Отмена».", level_up_hp_keyboard())
 
                 if state['step'] == 2:
+                    if message_text in ('отмена', 'отменить'):
+                        cancel_level_up(user_id)
+                        return
                     char = state['character']
                     maxhp = state['character']['max_hit_points']
                     hitdie = char['hit_die']
@@ -4069,12 +4318,14 @@ def handle_bot_event(incoming_event):
                     #         send_message(f"Введите значение от 1 до {hitdie + con_mod}")
                     else:
                         send_message(f"Выберите один из вариантов:", keyboard_maker(array_to_text_color_array(
-                                        ["Кинуть","Среднее","Вручную"]),onetime=True))
+                                        ["Кинуть","Среднее","Вручную","Отмена"]),onetime=True))
+                        return
                     newmaxhp+=maxhp
                     change_param(char, 'max_hit_points', newmaxhp)
                     send_message(f"Максимум ПЗ успешно узменен. Новый максимум — {newmaxhp} ПЗ.")
                     exit_state(show_message=False)
                     return
+                return
 
 
         if chat_id == None:
@@ -4425,102 +4676,14 @@ def handle_bot_event(incoming_event):
                 send_message(f"Ячейки {circle}-го круга: теперь {new_val} из {max_for_circle}.")
                 return
 
-            # Команда «сн очистить …» / «сн очисть …» / «сн очист …» — удалить ВСЕ предметы с указанным названием (по имени)
-            _msg_lower = message_text.strip().lower()
-            equipment_cmd_handled = False
-            clear_prefixes = (
-                'снаряжение очистить ', 'снаряжение очисть ', 'снаряжение очист ',
-                'экипировка очистить ', 'экипировка очисть ', 'экипировка очист ',
-                'снар очистить ', 'снар очисть ', 'снар очист ',
-                'экип очистить ', 'экип очисть ', 'экип очист ',
-                'сн очистить ', 'сн очисть ', 'сн очист ',
-            )
-            for prefix in clear_prefixes:
-                if _msg_lower.startswith(prefix):
-                    rest = message_text.strip()[len(prefix):].strip()
-                    if rest:
-                        try:
-                            char = load_main_character(user_id)
-                            characters = load_characters(user_id)
-                            names = [s.strip() for s in rest.split(',') if s.strip()]
-                            if not names:
-                                send_message("Укажите название предмета, например: сн очистить зелье лечение", keyboard=keyboards.main_keyboard)
-                            else:
-                                deleted, not_found = delete_equipment_by_name_all(char, names)
-                                replace_char(char, characters)
-                                write_characters(user_id, characters)
-                                msg = f"Удалено предметов: {deleted}."
-                                if not_found:
-                                    msg += "\n" + "\n".join(not_found)
-                                send_message(msg, keyboard=keyboards.main_keyboard)
-                                show_equipment(char, show_keyboard=False)
-                        except Exception:
-                            send_message("Ошибка при очистке. Формат: сн очистить название (удалит все с таким названием).", keyboard=keyboards.main_keyboard)
-                    else:
-                        send_message("Укажите название предмета, например: сн очистить зелье лечение", keyboard=keyboards.main_keyboard)
-                    equipment_cmd_handled = True
-                    break
-            if not equipment_cmd_handled:
-                delete_prefixes = ('снаряжение удалить ', 'снаряжение удал ', 'экипировка удалить ', 'экипировка удал ', 'снар удалить ', 'снар удал ', 'экип удалить ', 'экип удал ', 'сн удалить ', 'сн удал ')
-                for prefix in delete_prefixes:
-                    if _msg_lower.startswith(prefix):
-                        rest = message_text.strip()[len(prefix):].strip()
-                        if rest:
-                            try:
-                                char = load_main_character(user_id)
-                                characters = load_characters(user_id)
-                                parsed_items = parse_equipment_bulk(rest)
-                                if not parsed_items:
-                                    send_message("Не найдено ни одного предмета. Укажите что удалить: сн удал 5 Кинжал, рубин (50 зм)", keyboard=keyboards.main_keyboard)
-                                else:
-                                    deleted, errors = delete_equipment_bulk(char, parsed_items)
-                                    replace_char(char, characters)
-                                    write_characters(user_id, characters)
-                                    msg = f"Удалено предметов: {deleted}."
-                                    if errors:
-                                        msg += "\n" + "\n".join(errors)
-                                    send_message(msg, keyboard=keyboards.main_keyboard)
-                                    show_equipment(char, show_keyboard=False)
-                            except Exception:
-                                send_message("Ошибка при удалении. Формат: сн удал название [кол-во] [вес] [стоимость]. Совпадение по названию и стоимости.", keyboard=keyboards.main_keyboard)
-                        else:
-                            send_message("Укажите предметы для удаления, например: сн удал 5 Кинжал, рубин (50 зм)", keyboard=keyboards.main_keyboard)
-                        equipment_cmd_handled = True
-                        break
-            if not equipment_cmd_handled:
-                for prefix in ('снаряжение ', 'экипировка ', 'снар ', 'экип ', 'сн '):
-                    if _msg_lower.startswith(prefix):
-                        rest = message_text.strip()[len(prefix):].strip()
-                        if rest:
-                            try:
-                                char = load_main_character(user_id)
-                                characters = load_characters(user_id)
-                                parsed_items = parse_equipment_bulk(rest)
-                                if not parsed_items:
-                                    send_message("Не найдено ни одного предмета. Формат: 5 Кинжал, рубин (50 зм), ложка 1 фунт", keyboard=keyboards.main_keyboard)
-                                else:
-                                    for it in parsed_items:
-                                        create_item(char, name=it['name'], amount=it['amount'], cost=it['cost'] if it.get('cost') else None, weight_str=it.get('weight_str', ''))
-                                    replace_char(char, characters)
-                                    write_characters(user_id, characters)
-                                    send_message('Предметы добавлены.')
-                                    show_equipment(char, show_keyboard=False)
-                            except Exception:
-                                send_message("Ошибка при добавлении. Проверьте формат: название [кол-во] [вес] [стоимость].", keyboard=keyboards.main_keyboard)
-                        else:
-                            char = load_main_character(user_id)
-                            show_equipment(char, show_keyboard=False)
-                        equipment_cmd_handled = True
-                        break
-            if equipment_cmd_handled:
+            if try_handle_equipment_command(original_message_text, user_id):
                 return
             if message_text in dnd5e_data.code_fast_no_value:
-                if message_text in ['снар', 'снаряжение', 'сн', 'экип', 'экипировка']:
-                    char = load_main_character(user_id)
-                    show_equipment(char, show_keyboard=False)
                 if message_text in ['ячвосст','восстяч', 'восстановить ячейки']:
                     char = load_main_character(user_id)
-                    show_equipment(char, show_keyboard=False)
+                    char['current_spell_slots'] = list(char.get('spell_slots', [0] * 10))
+                    change_param(char, 'current_spell_slots', char['current_spell_slots'])
+                    send_message("Ячейки заклинаний восстановлены.")
                 if message_text in ['ос','особ', 'особенности']:
                     char = load_main_character(user_id)
                     show_features(char)
@@ -4551,20 +4714,11 @@ def handle_bot_event(incoming_event):
                 if message_text in ['короткий отдых','ко']:
                     char = load_main_character(user_id)
                     send_message(f"Вы совершаете короткий отдых и можете потратить {char['hit_dice_count']} КЗ, чтобы восстановить здоровье. \n\nНапишите /ко [количество КЗ], которое вы хотите потратить. Ваше здоровье восстановится после автоматичесткого броска.")
-                if message_text in ['lvlup','лвлап','повышение','повыш','новый уровень','новур']:
-                    char = load_main_character(user_id)
-                    lvl = char['level']
-                    if lvl == 20:
-                        send_message("Вы уже максимального уровня.")
-                    elif lvl > 1 or lvl < 20:
-                        change_param(char,'level',lvl+1)
-                        hit_dice_new_curr = char['hit_dice_count'] + 1
-                        newbonus = dnd5e_data.proficiency_bonus(lvl+1)
-                        change_param(char,'proficiency_bonus',newbonus)
-                        change_param(char,'hit_dice_max',lvl+1)
-                        change_param(char,'hit_dice_count',hit_dice_new_curr)
-                        send_message(f"Уровень успешно повышен. Теперь вы {lvl+1} уровня. Хотите ли изменить максимум пунктов здоровья?",keyboard=keyboard_maker(array_to_text_color_array(["Да","Нет"]),keyboard_columns=2,onetime=True))
-                        user_states[user_id] = {'character': char, 'state': 'hpincrease', 'step': 1}
+                if message_text in LEVEL_UP_COMMANDS:
+                    try:
+                        start_level_up(user_id, load_main_character(user_id))
+                    except (IndexError, TypeError):
+                        send_message("Персонаж не подключен.")
                 return
             elif message_text == 'я':
                 try:
@@ -4850,6 +5004,9 @@ def handle_bot_event(incoming_event):
                 send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
 
         # Обработка команд, доступных в личке бота
+
+        elif is_group_chat():
+            send_message("Команда не распознана.", keyboard=keyboards.main_keyboard)
 
 
 def init_vk():
